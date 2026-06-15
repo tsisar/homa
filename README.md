@@ -83,7 +83,7 @@ afplay reply.wav
 | `MCP_URL`          | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
 | `MCP_ALLOW`        | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
 | `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
-| `CONTEXT_TOKENS`   | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                         |
+| `CONTEXT_TOKENS`   | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                        |
 | `MAX_TOKENS`       | `512` — reply budget reserved below `CONTEXT_TOKENS`                                                                                                                        |
 | `ADDR`             | `:8080`                                                                                                                                                                     |
 | `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                                                                                                                             |
@@ -115,6 +115,29 @@ as `web_search` / `web_fetch` alongside `grafana_*`, `postgres_*`, etc.
 MCP_URL=http://mcp.tsisar.local/ MCP_ALLOW="web_*" go run .
 ```
 
+### Read-only Grafana tools
+
+Grafana tools can be added the same way. Since `matchAllow` only does trailing
+`prefix*` globs and Grafana namespaces every **read** tool under a verb prefix
+(`get_`, `list_`, `query_`, `search_`, `find_`), a read-only set is expressible
+without naming each tool — and it excludes every mutating tool (`create_*`,
+`update_*`, `add_*`, `alerting_manage_*`) plus the raw API passthrough
+`grafana_grafana_api_request`:
+
+```sh
+MCP_URL=http://mcp.tsisar.local/ \
+  MCP_ALLOW="web_*,grafana_get_*,grafana_list_*,grafana_query_*,grafana_search_*,grafana_find_*,grafana_generate_deeplink" \
+  go run .
+```
+
+That exposes ~45 tools, though — a lot of tool-schema to send every turn and
+hard for a small local model to choose between. For voice, prefer a tight,
+curated subset, e.g.:
+
+```sh
+MCP_ALLOW="web_*,grafana_query_prometheus,grafana_query_loki_logs,grafana_find_error_pattern_logs,grafana_list_alert_groups,grafana_get_current_oncall_users,grafana_search_dashboards"
+```
+
 How it works:
 
 - `respond()` runs the tool-use loop: send `tools` → on `tool_calls`, call each
@@ -124,10 +147,11 @@ How it works:
   e.g. "Let me look that up.") to mask tool latency. The CLI plays it immediately;
   `/api/talk` returns it in the `X-Filler-Text` header. (On the ESP32 it becomes
   a first audio segment over the future WebSocket.)
-- **Security:** `MCP_ALLOW` is an explicit allow-list (exact names, `prefix*`
-  glob, or `*`); empty = no tools. Keep it tight — the gateway also fronts
-  dangerous tools (`postgres_execute_sql`, dashboard writes) a voice assistant
-  should not reach.
+- **Security:** `MCP_ALLOW` is an explicit allow-list (exact names or a trailing
+  `prefix*` glob — no other wildcards; `*` = everything); empty = no tools. Keep
+  it tight — the gateway also fronts tools a voice assistant should never reach:
+  `postgres_execute_sql` (arbitrary SQL), `grafana_grafana_api_request` (raw
+  Grafana API — can write/delete), and Grafana `create_*` / `update_*` writes.
 
 ## Notes
 
