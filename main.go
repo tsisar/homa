@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -559,15 +560,32 @@ func (a *agent) serve() {
 		writeAudio(w, audio, mime)
 	})
 
-	// POST /api/stt (multipart, field "file" = 16-bit PCM WAV) -> {"text": "..."}.
+	// POST /api/stt -> {"text": "..."}. Two body shapes:
+	//   - streaming (the ESP32): raw signed-16-bit LE mono PCM, Content-Type
+	//     audio/L16, sample rate in ?rate= (default 16000); wrapped to WAV here.
+	//   - legacy: multipart/form-data field "file" = a complete WAV.
 	mux.HandleFunc("POST /api/stt", func(w http.ResponseWriter, r *http.Request) {
-		f, _, err := r.FormFile("file")
-		if err != nil {
-			http.Error(w, "expected multipart field 'file' (wav)", http.StatusBadRequest)
-			return
+		var wav []byte
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+			f, _, err := r.FormFile("file")
+			if err != nil {
+				http.Error(w, "expected multipart field 'file' (wav)", http.StatusBadRequest)
+				return
+			}
+			defer f.Close()
+			wav, _ = io.ReadAll(f)
+		} else {
+			rate, _ := strconv.Atoi(r.URL.Query().Get("rate"))
+			if rate <= 0 {
+				rate = 16000
+			}
+			pcm, err := io.ReadAll(r.Body) // chunked transfer is de-chunked transparently
+			if err != nil || len(pcm) == 0 {
+				http.Error(w, "empty PCM body", http.StatusBadRequest)
+				return
+			}
+			wav = pcmToWAV(pcm, rate, 1, 16)
 		}
-		defer f.Close()
-		wav, _ := io.ReadAll(f)
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 		text, err := a.lem.Transcribe(ctx, a.cfg.sttModel, wav, "en")
@@ -606,6 +624,30 @@ func decodeText(w http.ResponseWriter, r *http.Request) (string, bool) {
 func writeAudio(w http.ResponseWriter, audio []byte, mime string) {
 	w.Header().Set("Content-Type", mime)
 	_, _ = w.Write(audio)
+}
+
+// pcmToWAV prepends a 44-byte canonical WAV header to raw PCM samples so the
+// transcription endpoint gets a proper audio container.
+func pcmToWAV(pcm []byte, rate, channels, bits int) []byte {
+	n := len(pcm)
+	byteRate := rate * channels * bits / 8
+	blockAlign := channels * bits / 8
+	h := make([]byte, 44+n)
+	copy(h[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(h[4:8], uint32(36+n))
+	copy(h[8:12], "WAVE")
+	copy(h[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(h[16:20], 16) // PCM fmt chunk size
+	binary.LittleEndian.PutUint16(h[20:22], 1)  // audio format = PCM
+	binary.LittleEndian.PutUint16(h[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(h[24:28], uint32(rate))
+	binary.LittleEndian.PutUint32(h[28:32], uint32(byteRate))
+	binary.LittleEndian.PutUint16(h[32:34], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(h[34:36], uint16(bits))
+	copy(h[36:40], "data")
+	binary.LittleEndian.PutUint32(h[40:44], uint32(n))
+	copy(h[44:], pcm)
+	return h
 }
 
 // ---- local playback (macOS afplay) ---------------------------------------
