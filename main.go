@@ -181,14 +181,18 @@ type agent struct {
 	lastPrompt int // prompt_tokens of the most recent completion
 }
 
-func (a *agent) reset() {
+// reset clears the conversation and returns how many history messages were
+// dropped, so callers can log what the wipe affected.
+func (a *agent) reset() int {
 	a.turnMu.Lock() // wait for any in-flight turn so the wipe is authoritative
 	defer a.turnMu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	n := len(a.history)
 	a.summary = ""
 	a.history = nil
 	a.lastPrompt = 0
+	return n
 }
 
 const (
@@ -577,7 +581,8 @@ func (a *agent) serve() {
 
 	// POST /api/reset -> clears conversation history.
 	mux.HandleFunc("POST /api/reset", func(w http.ResponseWriter, r *http.Request) {
-		a.reset()
+		n := a.reset()
+		log.Printf("reset: cleared %d message(s)", n)
 		fmt.Fprintln(w, "ok")
 	})
 
