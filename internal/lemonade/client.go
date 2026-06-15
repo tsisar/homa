@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -14,6 +15,11 @@ import (
 
 	"github.com/tsisar/extended-log-go/log"
 )
+
+// ErrContextLength is wrapped into the error returned by Chat when the backend
+// rejects a request because the prompt exceeds the model's context window.
+// Callers can detect it with errors.Is and compact the conversation.
+var ErrContextLength = errors.New("context length exceeded")
 
 // Client talks to a Lemonade Server (directly or via the LLM gateway, which
 // proxies the same OpenAI-compatible API). BaseURL is e.g.
@@ -27,6 +33,9 @@ type Client struct {
 	// — otherwise they spend the whole token budget in reasoning_content and
 	// return empty content.
 	ChatTemplateKwargs map[string]any
+
+	// MaxTokens caps the reply length (max_tokens). Zero falls back to 512.
+	MaxTokens int
 }
 
 func New(baseURL string) *Client {
@@ -64,6 +73,12 @@ type ChatResult struct {
 	Content      string
 	ToolCalls    []ToolCall
 	FinishReason string
+
+	// PromptTokens and CompletionTokens are the server-reported usage for this
+	// call. PromptTokens is the exact size of what was sent — the authoritative
+	// signal for deciding when the conversation must be compacted.
+	PromptTokens     int
+	CompletionTokens int
 }
 
 type apiError struct {
@@ -128,16 +143,25 @@ type chatResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 	Error *apiError `json:"error"`
 }
 
 // Chat sends a non-streaming chat completion. tools may be nil.
 func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools []Tool) (*ChatResult, error) {
+	maxTokens := c.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 512
+	}
 	req := chatRequest{
 		Model:              model,
 		Messages:           toWire(msgs),
 		Temperature:        0.7,
-		MaxTokens:          512,
+		MaxTokens:          maxTokens,
 		Stream:             false,
 		ChatTemplateKwargs: c.ChatTemplateKwargs,
 	}
@@ -176,9 +200,18 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 		return nil, fmt.Errorf("chat decode (http %d): %w; body: %s", resp.StatusCode, err, snippet(data))
 	}
 	if cr.Error != nil {
+		if cr.Error.Code == "context_length_exceeded" || mentionsContextLimit(cr.Error.Message) {
+			return nil, fmt.Errorf("lemonade error: %s: %s: %w", cr.Error.Code, cr.Error.Message, ErrContextLength)
+		}
 		return nil, fmt.Errorf("lemonade error: %s: %s", cr.Error.Code, cr.Error.Message)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// Some gateways reshape the overflow into a bare non-200 whose body is not
+		// the OpenAI error shape; still surface it as ErrContextLength so the
+		// caller can compact and retry instead of wedging.
+		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge) && mentionsContextLimit(string(data)) {
+			return nil, fmt.Errorf("lemonade http %d: %s: %w", resp.StatusCode, snippet(data), ErrContextLength)
+		}
 		return nil, fmt.Errorf("lemonade http %d: %s", resp.StatusCode, snippet(data))
 	}
 	if len(cr.Choices) == 0 {
@@ -187,8 +220,10 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 
 	choice := cr.Choices[0]
 	res := &ChatResult{
-		Content:      strings.TrimSpace(choice.Message.Content),
-		FinishReason: choice.FinishReason,
+		Content:          strings.TrimSpace(choice.Message.Content),
+		FinishReason:     choice.FinishReason,
+		PromptTokens:     cr.Usage.PromptTokens,
+		CompletionTokens: cr.Usage.CompletionTokens,
 	}
 	for _, tc := range choice.Message.ToolCalls {
 		res.ToolCalls = append(res.ToolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
@@ -273,6 +308,26 @@ func (c *Client) Transcribe(ctx context.Context, model string, wav []byte, lang 
 		return "", fmt.Errorf("lemonade http %d: %s", resp.StatusCode, snippet(data))
 	}
 	return strings.TrimSpace(tr.Text), nil
+}
+
+// mentionsContextLimit reports whether s reads like a context-window overflow.
+// Backends and gateways word this differently, so match on several phrasings
+// rather than a single literal.
+func mentionsContextLimit(s string) bool {
+	s = strings.ToLower(s)
+	for _, k := range []string{
+		"exceeds the available context",
+		"context length",
+		"maximum context",
+		"context window",
+		"n_ctx",
+		"too many tokens",
+	} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
 }
 
 func snippet(b []byte) string {

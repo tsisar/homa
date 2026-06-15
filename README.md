@@ -83,6 +83,8 @@ afplay reply.wav
 | `MCP_URL`          | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
 | `MCP_ALLOW`        | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
 | `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
+| `CONTEXT_TOKENS`   | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                         |
+| `MAX_TOKENS`       | `512` — reply budget reserved below `CONTEXT_TOKENS`                                                                                                                        |
 | `ADDR`             | `:8080`                                                                                                                                                                     |
 | `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                                                                                                                             |
 | `LOG_LEVEL`        | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down                                                             |
@@ -142,6 +144,13 @@ How it works:
   `DISABLE_THINKING`). Without it the reply is empty.
 - Kokoro audio is 24000 Hz mono; Lemonade returns it as float WAV, passed
   through to clients / `afplay` as-is.
+- **Context management:** the conversation is sent in full every turn, so it
+  grows until it hits the model's window. Homa keeps the system prompt plus the
+  recent turns verbatim and folds older turns into a rolling summary. It compacts
+  proactively (when the previous request's reported `prompt_tokens` nears
+  `CONTEXT_TOKENS - MAX_TOKENS`) and reactively (on a `context_length_exceeded`
+  from the backend it summarizes and retries), so the assistant never wedges on a
+  long conversation. `POST /api/reset` clears both history and summary.
 
 ## Parked: Ukrainian
 

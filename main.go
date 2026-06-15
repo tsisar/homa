@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,9 @@ type config struct {
 	searchFiller    string
 	addr            string
 	systemPrompt    string
+	contextTokens   int // model context window; history is summarized before it fills
+	maxTokens       int // reply budget reserved below the context window
+	toolOutputLimit int // chars a single tool result may add to live history
 }
 
 func loadConfig() config {
@@ -68,6 +73,11 @@ func loadConfig() config {
 		searchFiller:    envOr("SEARCH_FILLER", "Let me look that up."), // spoken before tools run; empty = off
 		addr:            envOr("ADDR", ":8080"),
 		systemPrompt:    envOr("SYSTEM_PROMPT", defaultSystemPrompt),
+		// CONTEXT_TOKENS must match the backend's served context (llama-server
+		// -c / --ctx-size). The default mirrors a conservative 4096 window.
+		contextTokens:   envInt("CONTEXT_TOKENS", 4096),
+		maxTokens:       envInt("MAX_TOKENS", 512),
+		toolOutputLimit: envInt("TOOL_OUTPUT_LIMIT", 8000),
 	}
 }
 
@@ -92,11 +102,15 @@ func main() {
 	flag.Parse()
 
 	cfg := loadConfig()
+	if cfg.maxTokens+ctxSafetyMargin >= cfg.contextTokens {
+		log.Printf("warning: MAX_TOKENS (%d) + margin >= CONTEXT_TOKENS (%d); proactive compaction is disabled, relying on the reactive path", cfg.maxTokens, cfg.contextTokens)
+	}
 	ag := &agent{
 		cfg: cfg,
 		lem: lemonade.New(cfg.apiURL), // chat + STT, both via the single endpoint
 		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat),
 	}
+	ag.lem.MaxTokens = cfg.maxTokens
 	if cfg.disableThinking {
 		// Qwen3-family models reason into reasoning_content and leave content
 		// empty unless thinking is disabled — fatal for a voice loop.
@@ -152,17 +166,64 @@ type agent struct {
 	tts   *tts.OpenAISpeech
 	tools toolExecutor // nil when MCP is disabled
 
-	mu      sync.Mutex
-	history []lemonade.Message
+	// turnMu serializes whole turns. compact() releases a.mu across a slow
+	// summarize() call, so without this two concurrent turns (or a reset racing
+	// a turn) could interleave and drop live history. a.mu still guards the
+	// short critical sections; lock order is always turnMu before a.mu.
+	turnMu sync.Mutex
+
+	mu sync.Mutex
+	// summary is a rolling memory of turns that were evicted to free context;
+	// history holds the recent turns verbatim. The system prompt is not stored
+	// here — messages() prepends it (and the summary) on every request.
+	summary    string
+	history    []lemonade.Message
+	lastPrompt int // prompt_tokens of the most recent completion
 }
 
 func (a *agent) reset() {
+	a.turnMu.Lock() // wait for any in-flight turn so the wipe is authoritative
+	defer a.turnMu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.history = []lemonade.Message{{Role: "system", Content: a.cfg.systemPrompt}}
+	a.summary = ""
+	a.history = nil
+	a.lastPrompt = 0
 }
 
-const maxToolRounds = 5
+const (
+	maxToolRounds     = 5    // tool-calling rounds before forcing a final answer
+	keepRecent        = 6    // recent messages kept verbatim when compacting
+	ctxSafetyMargin   = 256  // tokens left free below the window
+	toolDigestLimit   = 500  // chars of a tool result kept in summaries / last-resort truncation
+	summaryCharLimit  = 1500 // hard cap on the rolling summary so it can't grow into the window
+	maxCompactRetries = 4    // compaction attempts on a context-overflow before giving up
+)
+
+// messages assembles the full request: a single system message (the prompt plus
+// the rolling summary, if any) followed by the recent turns. The summary is
+// folded into the one system message rather than added as a second one, since
+// some chat templates only treat the first system message specially. Callers
+// must hold a.mu.
+func (a *agent) messages() []lemonade.Message {
+	system := a.cfg.systemPrompt
+	if a.summary != "" {
+		system += "\n\nSummary of the conversation so far:\n" + a.summary
+	}
+	out := make([]lemonade.Message, 0, len(a.history)+1)
+	out = append(out, lemonade.Message{Role: "system", Content: system})
+	return append(out, a.history...)
+}
+
+// overBudget reports whether the last request came close enough to the context
+// window that the next one should be compacted first. Callers must hold a.mu.
+func (a *agent) overBudget() bool {
+	threshold := a.cfg.contextTokens - a.cfg.maxTokens - ctxSafetyMargin
+	if threshold <= 0 {
+		return false // misconfigured window; the reactive path still protects us
+	}
+	return a.lastPrompt > 0 && a.lastPrompt >= threshold
+}
 
 // respond runs one conversational turn with a tool-calling loop, then
 // synthesizes the final reply. onFiller, if set, is called once with a short
@@ -170,9 +231,19 @@ const maxToolRounds = 5
 // "let me check that" cue while the (slow) tool calls run. Returns reply text,
 // audio, and its mime.
 func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFiller func(string)) (string, []byte, string, error) {
+	a.turnMu.Lock()
+	defer a.turnMu.Unlock()
+
 	a.mu.Lock()
 	a.history = append(a.history, lemonade.Message{Role: "user", Content: userText})
+	over := a.overBudget()
 	a.mu.Unlock()
+
+	// Summarize before we send if the previous turn neared the window, so this
+	// turn starts well below it.
+	if over {
+		a.compact(ctx)
+	}
 
 	var tools []lemonade.Tool
 	if a.tools != nil {
@@ -182,17 +253,13 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 	reply := ""
 	announced := false
 	for round := 0; ; round++ {
-		a.mu.Lock()
-		msgs := append([]lemonade.Message(nil), a.history...)
-		a.mu.Unlock()
-
 		// After the budget, stop offering tools so the model must answer.
 		offer := tools
 		if round >= maxToolRounds {
 			offer = nil
 		}
 
-		res, err := a.lem.Chat(ctx, a.cfg.chatModel, msgs, offer)
+		res, err := a.chat(ctx, offer)
 		if err != nil {
 			return "", nil, "", fmt.Errorf("llm: %w", err)
 		}
@@ -214,6 +281,9 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 					out = "(no output)"
 				}
 				log.Printf("tool %s(%s) -> %d chars", tc.Name, truncate(tc.Arguments, 100), len(out))
+				// Cap the live message: proactive compaction only runs before the
+				// loop, so a single runaway page must not blow the window mid-turn.
+				out = clampText(out, a.cfg.toolOutputLimit)
 				a.mu.Lock()
 				a.history = append(a.history, lemonade.Message{Role: "tool", ToolCallID: tc.ID, Content: out})
 				a.mu.Unlock()
@@ -239,6 +309,202 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 		return reply, nil, "", fmt.Errorf("tts: %w", err)
 	}
 	return reply, audio, mime, nil
+}
+
+// chat sends the current conversation. On a context-window overflow it compacts
+// the history and retries, so a long conversation degrades gracefully instead
+// of wedging the assistant.
+func (a *agent) chat(ctx context.Context, offer []lemonade.Tool) (*lemonade.ChatResult, error) {
+	for attempt := 0; ; attempt++ {
+		a.mu.Lock()
+		msgs := a.messages()
+		a.mu.Unlock()
+
+		res, err := a.lem.Chat(ctx, a.cfg.chatModel, msgs, offer)
+		if err == nil {
+			a.mu.Lock()
+			a.lastPrompt = res.PromptTokens
+			a.mu.Unlock()
+			return res, nil
+		}
+		if !errors.Is(err, lemonade.ErrContextLength) || attempt >= maxCompactRetries {
+			return nil, err
+		}
+		if !a.compact(ctx) {
+			return nil, err // nothing left to shed
+		}
+	}
+}
+
+// compact folds the oldest turns into the rolling summary and drops them,
+// freeing context. It returns true if it shed anything.
+func (a *agent) compact(ctx context.Context) bool {
+	a.mu.Lock()
+	older, _, ok := splitForCompaction(a.history)
+	prev := a.summary
+	olderLen := len(older)
+	a.mu.Unlock()
+
+	// Nothing older than the current turn to evict (e.g. one turn with a huge
+	// tool result, or a summary that has itself grown too large): clip in place.
+	if !ok {
+		return a.truncateOversized()
+	}
+
+	newSummary, err := a.summarize(ctx, prev, older)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if olderLen > len(a.history) { // history changed under us; bail safely
+		return false
+	}
+	if err != nil {
+		// Summarizer unavailable: drop the old turns anyway (lossy but safe).
+		a.history = append([]lemonade.Message(nil), a.history[olderLen:]...)
+		log.Printf("compact: summarize failed, dropped %d msg(s): %v", olderLen, err)
+		return true
+	}
+	// Cap the summary so it can never grow into the window on its own.
+	a.summary = clampText(newSummary, summaryCharLimit)
+	a.history = append([]lemonade.Message(nil), a.history[olderLen:]...)
+	log.Printf("compact: folded %d msg(s) into summary (%d chars), prompt was %d tok", olderLen, len(a.summary), a.lastPrompt)
+	return true
+}
+
+// summarize produces an updated rolling summary from the previous summary plus
+// the evicted turns. It calls the model directly (never a.chat) so it can't
+// recurse into compaction.
+func (a *agent) summarize(ctx context.Context, prev string, older []lemonade.Message) (string, error) {
+	var b strings.Builder
+	if prev != "" {
+		b.WriteString("Current summary:\n")
+		b.WriteString(prev)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Conversation to fold in:\n")
+	b.WriteString(renderTranscript(older))
+	b.WriteString("\nReturn the updated summary.")
+
+	msgs := []lemonade.Message{
+		{Role: "system", Content: summarizerPrompt},
+		{Role: "user", Content: b.String()},
+	}
+	res, err := a.lem.Chat(ctx, a.cfg.chatModel, msgs, nil)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Content), nil
+}
+
+const summarizerPrompt = "You maintain a brief running memory of a voice-assistant conversation. " +
+	"Rewrite it to fold in the new turns, keeping only durable facts, user preferences, decisions, and unresolved questions. " +
+	"Drop greetings and small talk. Be concise — a few plain sentences, no markdown or lists."
+
+// splitForCompaction returns the oldest messages to evict and the recent ones
+// to keep. It cuts at a user-message boundary so an assistant tool-call and its
+// tool results are never separated. ok is false when there is nothing older
+// than the current turn to evict.
+func splitForCompaction(h []lemonade.Message) (older, keep []lemonade.Message, ok bool) {
+	split := -1
+	kept := 0
+	for i := len(h) - 1; i >= 0; i-- {
+		kept++
+		if kept >= keepRecent && h[i].Role == "user" {
+			split = i
+			break
+		}
+	}
+	if split <= 0 {
+		// Shorter than the keep window, or no early boundary: evict everything
+		// before the last user turn.
+		split = lastUserIndex(h)
+	}
+	if split <= 0 {
+		return nil, h, false
+	}
+	return h[:split], h[split:], true
+}
+
+func lastUserIndex(h []lemonade.Message) int {
+	for i := len(h) - 1; i >= 0; i-- {
+		if h[i].Role == "user" {
+			return i
+		}
+	}
+	return -1
+}
+
+// truncateOversized clips every history message that exceeds the digest limit
+// (and, failing that, the rolling summary) down to that limit. It is the last
+// resort when a single turn — or the summary alone — fills the window and there
+// is nothing to summarize. Each clip lands exactly at the limit so an already
+// clipped message is never reselected: progress is honest and the chat() retry
+// loop terminates.
+func (a *agent) truncateOversized() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := false
+	for i := range a.history {
+		if len(a.history[i].Content) > toolDigestLimit {
+			a.history[i].Content = clampText(a.history[i].Content, toolDigestLimit)
+			changed = true
+		}
+	}
+	if !changed && len(a.summary) > summaryCharLimit {
+		a.summary = clampText(a.summary, summaryCharLimit)
+		changed = true
+	}
+	return changed
+}
+
+// clampText trims s to at most limit bytes, marking the cut. The result is
+// exactly limit bytes when clipped, so re-clamping the same value is a no-op.
+// limit <= 0 disables clamping.
+func clampText(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	const marker = " [truncated]"
+	if limit <= len(marker) {
+		return s[:limit]
+	}
+	return s[:limit-len(marker)] + marker
+}
+
+// renderTranscript flattens turns into plain text for the summarizer, clipping
+// bulky tool results so the summary call itself stays within the window.
+func renderTranscript(msgs []lemonade.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			b.WriteString("User: ")
+			b.WriteString(m.Content)
+			b.WriteString("\n")
+		case "assistant":
+			if c := strings.TrimSpace(m.Content); c != "" {
+				b.WriteString("Assistant: ")
+				b.WriteString(c)
+				b.WriteString("\n")
+			}
+			for _, tc := range m.ToolCalls {
+				b.WriteString("Assistant used ")
+				b.WriteString(tc.Name)
+				b.WriteString("(")
+				b.WriteString(truncate(tc.Arguments, 120))
+				b.WriteString(")\n")
+			}
+		case "tool":
+			b.WriteString("Result: ")
+			b.WriteString(truncate(oneLine(m.Content), toolDigestLimit))
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // ---- HTTP server (also the future ESP32 entry point) ---------------------
@@ -372,6 +638,16 @@ func sanitize(s string) string {
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+		log.Printf("invalid %s=%q, using %d", key, v, def)
 	}
 	return def
 }
