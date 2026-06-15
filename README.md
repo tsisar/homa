@@ -85,6 +85,8 @@ afplay reply.wav
 | `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
 | `CONTEXT_TOKENS`   | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                        |
 | `MAX_TOKENS`       | `512` — reply budget reserved below `CONTEXT_TOKENS`                                                                                                                        |
+| `TOOL_OUTPUT_LIMIT`| `8000` — max chars a single tool result may add to live history                                                                                                             |
+| `MAX_TOOL_ROUNDS`  | `8` — tool-calling rounds before the model is nudged to answer in words                                                                                                     |
 | `ADDR`             | `:8080`                                                                                                                                                                     |
 | `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                                                                                                                             |
 | `LOG_LEVEL`        | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down                                                             |
@@ -141,8 +143,10 @@ MCP_ALLOW="web_*,grafana_query_prometheus,grafana_query_loki_logs,grafana_find_e
 How it works:
 
 - `respond()` runs the tool-use loop: send `tools` → on `tool_calls`, call each
-  via `internal/mcp` and feed back a `role:"tool"` message → repeat (≤5 rounds,
-  then answer without tools).
+  via `internal/mcp` and feed back a `role:"tool"` message → repeat (up to
+  `MAX_TOOL_ROUNDS`, then tools are withdrawn and the model is nudged to answer
+  in words). A reply that still looks like a tool call (the model occasionally
+  emits one as plain text) is suppressed rather than read aloud.
 - When Homa first decides to use a tool it speaks a short filler (`SEARCH_FILLER`,
   e.g. "Let me look that up.") to mask tool latency. The CLI plays it immediately;
   `/api/talk` returns it in the `X-Filler-Text` header. (On the ESP32 it becomes

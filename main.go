@@ -53,6 +53,7 @@ type config struct {
 	contextTokens   int // model context window; history is summarized before it fills
 	maxTokens       int // reply budget reserved below the context window
 	toolOutputLimit int // chars a single tool result may add to live history
+	maxToolRounds   int // tool-calling rounds before forcing a final answer
 }
 
 func loadConfig() config {
@@ -79,6 +80,7 @@ func loadConfig() config {
 		contextTokens:   envInt("CONTEXT_TOKENS", 4096),
 		maxTokens:       envInt("MAX_TOKENS", 512),
 		toolOutputLimit: envInt("TOOL_OUTPUT_LIMIT", 8000),
+		maxToolRounds:   envInt("MAX_TOOL_ROUNDS", 8),
 	}
 }
 
@@ -197,13 +199,16 @@ func (a *agent) reset() int {
 }
 
 const (
-	maxToolRounds     = 5    // tool-calling rounds before forcing a final answer
 	keepRecent        = 6    // recent messages kept verbatim when compacting
 	ctxSafetyMargin   = 256  // tokens left free below the window
 	toolDigestLimit   = 500  // chars of a tool result kept in summaries / last-resort truncation
 	summaryCharLimit  = 1500 // hard cap on the rolling summary so it can't grow into the window
 	maxCompactRetries = 4    // compaction attempts on a context-overflow before giving up
 )
+
+// finalAnswerNudge steers the model to answer in words on the round where tools
+// are withdrawn, so it doesn't emit another (text) tool call to be read aloud.
+const finalAnswerNudge = "Answer my question now in one or two plain spoken sentences, using what you already have. Do not call any tools or output any tool-call syntax."
 
 // messages assembles the full request: a single system message (the prompt plus
 // the rolling summary, if any) followed by the recent turns. The summary is
@@ -258,13 +263,17 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 	reply := ""
 	announced := false
 	for round := 0; ; round++ {
-		// After the budget, stop offering tools so the model must answer.
+		// After the budget, stop offering tools and nudge the model to answer in
+		// words — otherwise it tends to emit one more tool call as plain text,
+		// which would be read aloud.
 		offer := tools
-		if round >= maxToolRounds {
+		nudge := ""
+		if round >= a.cfg.maxToolRounds {
 			offer = nil
+			nudge = finalAnswerNudge
 		}
 
-		res, err := a.chat(ctx, offer)
+		res, err := a.chat(ctx, offer, nudge)
 		if err != nil {
 			return "", nil, "", fmt.Errorf("llm: %w", err)
 		}
@@ -304,8 +313,15 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 		break
 	}
 
+	// Never speak a tool call: the model sometimes emits one as plain text
+	// (e.g. when tools were withdrawn at the budget) and llama.cpp returns it as
+	// content rather than structured tool_calls.
+	if looksLikeToolCall(reply) {
+		log.Printf("reply looked like a tool call; suppressing: %s", truncate(oneLine(reply), 120))
+		reply = ""
+	}
 	if reply == "" {
-		reply = "Sorry, I didn't catch that."
+		reply = "Sorry, I couldn't get that just now."
 	}
 	reply = sanitize(reply)
 
@@ -324,11 +340,15 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 // chat sends the current conversation. On a context-window overflow it compacts
 // the history and retries, so a long conversation degrades gracefully instead
 // of wedging the assistant.
-func (a *agent) chat(ctx context.Context, offer []lemonade.Tool) (*lemonade.ChatResult, error) {
+func (a *agent) chat(ctx context.Context, offer []lemonade.Tool, nudge string) (*lemonade.ChatResult, error) {
 	for attempt := 0; ; attempt++ {
 		a.mu.Lock()
 		msgs := a.messages()
 		a.mu.Unlock()
+		// Transient steering for this call only; never persisted to history.
+		if nudge != "" {
+			msgs = append(msgs, lemonade.Message{Role: "user", Content: nudge})
+		}
 
 		res, err := a.lem.Chat(ctx, a.cfg.chatModel, msgs, offer)
 		if err == nil {
@@ -708,6 +728,23 @@ func playAudio(audio []byte, mime string) {
 }
 
 // ---- misc ----------------------------------------------------------------
+
+// looksLikeToolCall reports whether s is a tool-call template the model leaked
+// into its reply text (Qwen/Hermes XML, or a bare JSON call) instead of a real
+// answer — so it is never read aloud.
+func looksLikeToolCall(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, "<tool_call") || strings.Contains(s, "<function=") || strings.Contains(s, "<function ") {
+		return true
+	}
+	if strings.HasPrefix(s, "{") && strings.Contains(s, `"name"`) && strings.Contains(s, `"arguments"`) {
+		return true
+	}
+	return false
+}
 
 // sanitize strips markdown-ish characters the model may emit despite the
 // system prompt, so they aren't read aloud.

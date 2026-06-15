@@ -128,6 +128,33 @@ func TestTruncateOversizedProgressThenStops(t *testing.T) {
 	}
 }
 
+func TestLooksLikeToolCall(t *testing.T) {
+	// the exact shape leaked into content in the wild (Qwen XML tool call)
+	leaked := "<tool_call>\n<function=grafana_query_prometheus>\n<parameter=datasourceUid>\nPBFA97CFB590B2093\n</parameter>\n</function>\n</tool_call>"
+	toolCalls := []string{
+		leaked,
+		"<function=foo>\n</function>",
+		`{"name":"grafana_query_prometheus","arguments":{"expr":"up"}}`,
+		`  {"arguments": {}, "name": "x"}  `,
+	}
+	answers := []string{
+		"The median request time is about half a second.",
+		"I couldn't find that metric, sorry.",
+		"",
+		"I used the search function to look it up.", // mentions "function" but is real speech
+	}
+	for _, s := range toolCalls {
+		if !looksLikeToolCall(s) {
+			t.Errorf("looksLikeToolCall(%q) = false, want true", truncate(s, 40))
+		}
+	}
+	for _, s := range answers {
+		if looksLikeToolCall(s) {
+			t.Errorf("looksLikeToolCall(%q) = true, want false", truncate(s, 40))
+		}
+	}
+}
+
 func TestTruncateOversizedClipsSummary(t *testing.T) {
 	a := &agent{}
 	a.summary = strings.Repeat("z", 4000) // nothing in history; summary alone is too big
