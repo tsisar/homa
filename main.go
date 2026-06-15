@@ -33,7 +33,8 @@ import (
 )
 
 type config struct {
-	lemonadeURL     string
+	lemonadeURL     string // direct Lemonade, used for STT + TTS (the LLM gateway is chat-only)
+	chatURL         string // chat-completions endpoint — the kgateway LLM gateway, local provider
 	chatModel       string
 	sttModel        string
 	ttsURL          string
@@ -52,6 +53,7 @@ func loadConfig() config {
 	lem := envOr("LEMONADE_URL", "http://192.168.88.83:8000/api/v1")
 	return config{
 		lemonadeURL:     lem,
+		chatURL:         envOr("CHAT_URL", "http://llm.tsisar.local/local/v1"), // gateway, local provider
 		chatModel:       envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
 		sttModel:        envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
 		ttsURL:          envOr("TTS_URL", lem),
@@ -91,7 +93,8 @@ func main() {
 	cfg := loadConfig()
 	ag := &agent{
 		cfg: cfg,
-		llm: lemonade.New(cfg.lemonadeURL),
+		llm: lemonade.New(cfg.chatURL),     // chat via the kgateway LLM gateway (local provider)
+		stt: lemonade.New(cfg.lemonadeURL), // STT direct to Lemonade (gateway is chat-only)
 		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat),
 	}
 	if cfg.disableThinking {
@@ -145,7 +148,8 @@ func main() {
 
 type agent struct {
 	cfg   config
-	llm   *lemonade.Client
+	llm   *lemonade.Client // chat (via the LLM gateway)
+	stt   *lemonade.Client // transcription (direct to Lemonade)
 	tts   *tts.OpenAISpeech
 	tools toolExecutor // nil when MCP is disabled
 
@@ -295,7 +299,7 @@ func (a *agent) serve() {
 		wav, _ := io.ReadAll(f)
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		text, err := a.llm.Transcribe(ctx, a.cfg.sttModel, wav, "en")
+		text, err := a.stt.Transcribe(ctx, a.cfg.sttModel, wav, "en")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return

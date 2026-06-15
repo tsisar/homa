@@ -68,7 +68,8 @@ afplay reply.wav
 
 | Var                | Default                                                               |
 |--------------------|-----------------------------------------------------------------------|
-| `LEMONADE_URL`     | `http://192.168.88.83:8000/api/v1`                                    |
+| `CHAT_URL`         | `http://llm.tsisar.local/local/v1` — chat via the kgateway LLM gateway (local provider) |
+| `LEMONADE_URL`     | `http://192.168.88.83:8000/api/v1` — direct Lemonade, used for STT + TTS |
 | `CHAT_MODEL`       | `Qwen3.6-35B-A3B-MTP-GGUF`                                            |
 | `STT_MODEL`        | `Whisper-Large-v3-Turbo`                                              |
 | `TTS_URL`          | = `LEMONADE_URL` (Kokoro on Lemonade)                                 |
@@ -123,6 +124,11 @@ How it works:
 
 ## Notes
 
+- **Routing:** chat completions go through the kgateway LLM gateway (`CHAT_URL`,
+  `local` provider — Homa uses only local models, never the gateway's OpenAI /
+  Anthropic providers). STT and TTS go **direct to Lemonade** (`LEMONADE_URL`)
+  because the LLM gateway fronts chat only. The gateway preserves
+  `chat_template_kwargs` (thinking-disable) and tool calls.
 - `Qwen3.6-35B-A3B` is a reasoning model: it emits chain-of-thought in
   `reasoning_content` and leaves `content` empty unless thinking is disabled.
   Homa sends `chat_template_kwargs.enable_thinking=false` (toggle with
