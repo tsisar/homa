@@ -43,8 +43,18 @@ type speechRequest struct {
 	ResponseFormat string `json:"response_format"`
 }
 
-// Speak synthesizes text and returns (audioBytes, contentType).
+// Speak synthesizes text in the configured default format.
 func (s *OpenAISpeech) Speak(ctx context.Context, text string) ([]byte, string, error) {
+	return s.SpeakAs(ctx, text, s.Format)
+}
+
+// SpeakAs synthesizes text in the given response_format (wav|mp3|pcm|opus|flac);
+// an empty format falls back to the configured default. This lets one endpoint
+// serve different clients — e.g. wav for browsers, raw 16-bit pcm for the ESP32.
+func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte, string, error) {
+	if format = strings.TrimSpace(format); format == "" {
+		format = s.Format
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil, "", fmt.Errorf("tts: empty text")
@@ -54,7 +64,7 @@ func (s *OpenAISpeech) Speak(ctx context.Context, text string) ([]byte, string, 
 		Model:          s.Model,
 		Input:          text,
 		Voice:          s.Voice,
-		ResponseFormat: s.Format,
+		ResponseFormat: format,
 	})
 	if err != nil {
 		return nil, "", err
@@ -67,7 +77,7 @@ func (s *OpenAISpeech) Speak(ctx context.Context, text string) ([]byte, string, 
 	req.Header.Set("Content-Type", "application/json")
 
 	// Trace: TTS request metadata only — skip the synthesized audio (response is a blob).
-	log.Tracef("[tts] request: model=%s voice=%s format=%s input=%dB", s.Model, s.Voice, s.Format, len(text))
+	log.Tracef("[tts] request: model=%s voice=%s format=%s input=%dB", s.Model, s.Voice, format, len(text))
 
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
@@ -85,7 +95,7 @@ func (s *OpenAISpeech) Speak(ctx context.Context, text string) ([]byte, string, 
 
 	mime := resp.Header.Get("Content-Type")
 	if mime == "" || strings.HasPrefix(mime, "application/json") {
-		mime = "audio/" + s.Format
+		mime = "audio/" + format
 	}
 	return data, mime, nil
 }

@@ -70,23 +70,23 @@ afplay reply.wav
 
 ## Configuration (env vars)
 
-| Var                | Default                                                               |
-|--------------------|-----------------------------------------------------------------------|
+| Var                | Default                                                                                                                                                                     |
+|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `API_URL`          | `http://llm.tsisar.local/local/v1` — single endpoint for chat + STT + TTS (LLM gateway, local provider). Set to `http://192.168.88.83:8000/api/v1` to hit Lemonade directly |
-| `CHAT_MODEL`       | `Qwen3.6-35B-A3B-MTP-GGUF`                                            |
-| `STT_MODEL`        | `Whisper-Large-v3-Turbo`                                              |
-| `TTS_URL`          | = `API_URL` (optional override, e.g. Chatterbox on a Mac)             |
-| `TTS_MODEL`        | `kokoro-v1`                                                           |
-| `TTS_VOICE`        | `af_heart` (warm female; `am_michael`, `bf_emma`)                     |
-| `TTS_FORMAT`       | `wav`                                                                 |
-| `DISABLE_THINKING` | `true`                                                                |
-| `MCP_URL`          | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                 |
-| `MCP_ALLOW`        | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`             |
-| `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables |
-| `ADDR`             | `:8080`                                                               |
-| `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                       |
-| `LOG_LEVEL`        | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down |
-| `LOG_TIMEZONE`     | host local; e.g. `Asia/Dubai` — timestamp zone for logs              |
+| `CHAT_MODEL`       | `Qwen3.6-35B-A3B-MTP-GGUF`                                                                                                                                                  |
+| `STT_MODEL`        | `Whisper-Large-v3-Turbo`                                                                                                                                                    |
+| `TTS_URL`          | = `API_URL` (optional override, e.g. Chatterbox on a Mac)                                                                                                                   |
+| `TTS_MODEL`        | `kokoro-v1`                                                                                                                                                                 |
+| `TTS_VOICE`        | `af_heart` (warm female; `am_michael`, `bf_emma`)                                                                                                                           |
+| `TTS_FORMAT`       | `wav`                                                                                                                                                                       |
+| `DISABLE_THINKING` | `true`                                                                                                                                                                      |
+| `MCP_URL`          | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
+| `MCP_ALLOW`        | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
+| `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
+| `ADDR`             | `:8080`                                                                                                                                                                     |
+| `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                                                                                                                             |
+| `LOG_LEVEL`        | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down                                                             |
+| `LOG_TIMEZONE`     | host local; e.g. `Asia/Dubai` — timestamp zone for logs                                                                                                                     |
 
 ### Switching to Chatterbox (expressive) later
 

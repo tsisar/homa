@@ -128,7 +128,7 @@ func main() {
 	case *once != "":
 		ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 		defer cancel()
-		reply, audio, mime, err := ag.respond(ctx, *once, func(text string) {
+		reply, audio, mime, err := ag.respond(ctx, *once, "", func(text string) {
 			fmt.Printf("… %s\n", text)
 			if fa, fm, ferr := ag.tts.Speak(ctx, text); ferr == nil {
 				playAudio(fa, fm)
@@ -169,7 +169,7 @@ const maxToolRounds = 5
 // phrase the moment the agent decides to use tools — so the caller can speak a
 // "let me check that" cue while the (slow) tool calls run. Returns reply text,
 // audio, and its mime.
-func (a *agent) respond(ctx context.Context, userText string, onFiller func(string)) (string, []byte, string, error) {
+func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFiller func(string)) (string, []byte, string, error) {
 	a.mu.Lock()
 	a.history = append(a.history, lemonade.Message{Role: "user", Content: userText})
 	a.mu.Unlock()
@@ -234,7 +234,7 @@ func (a *agent) respond(ctx context.Context, userText string, onFiller func(stri
 	a.history = append(a.history, lemonade.Message{Role: "assistant", Content: reply})
 	a.mu.Unlock()
 
-	audio, mime, err := a.tts.Speak(ctx, reply)
+	audio, mime, err := a.tts.SpeakAs(ctx, reply, ttsFormat)
 	if err != nil {
 		return reply, nil, "", fmt.Errorf("tts: %w", err)
 	}
@@ -258,7 +258,9 @@ func (a *agent) serve() {
 		ctx, cancel := context.WithTimeout(r.Context(), 240*time.Second)
 		defer cancel()
 		var filler string
-		reply, audio, mime, err := a.respond(ctx, text, func(t string) { filler = t })
+		// ?format= lets a client pick the audio encoding (e.g. the ESP32 asks for
+		// raw 16-bit pcm); empty falls back to the configured TTS_FORMAT.
+		reply, audio, mime, err := a.respond(ctx, text, r.URL.Query().Get("format"), func(t string) { filler = t })
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -279,7 +281,7 @@ func (a *agent) serve() {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		audio, mime, err := a.tts.Speak(ctx, text)
+		audio, mime, err := a.tts.SpeakAs(ctx, text, r.URL.Query().Get("format"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
