@@ -11,6 +11,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+
+	"github.com/tsisar/extended-log-go/log"
 )
 
 // Client talks to a Lemonade Server (directly or via the LLM gateway, which
@@ -157,6 +159,9 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
+	// Trace: full request to the model (mirrors alert-agent's llm clients).
+	log.Tracef("[llm] request: %s", body)
+
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("chat request: %w", err)
@@ -164,6 +169,8 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 	defer resp.Body.Close()
 
 	data, _ := io.ReadAll(resp.Body)
+	// Trace: full response from the model.
+	log.Tracef("[llm] response: %s", data)
 	var cr chatResponse
 	if err := json.Unmarshal(data, &cr); err != nil {
 		return nil, fmt.Errorf("chat decode (http %d): %w; body: %s", resp.StatusCode, err, snippet(data))
@@ -240,6 +247,9 @@ func (c *Client) Transcribe(ctx context.Context, model string, wav []byte, lang 
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
+	// Trace: STT request metadata only — the body is a raw WAV blob.
+	log.Tracef("[stt] request: model=%s lang=%s wav=%dB", model, lang, len(wav))
+
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("transcribe request: %w", err)
@@ -247,6 +257,8 @@ func (c *Client) Transcribe(ctx context.Context, model string, wav []byte, lang 
 	defer resp.Body.Close()
 
 	data, _ := io.ReadAll(resp.Body)
+	// Trace: STT response is small JSON ({"text":...}) — safe to log in full.
+	log.Tracef("[stt] response: %s", data)
 	var tr struct {
 		Text  string    `json:"text"`
 		Error *apiError `json:"error"`

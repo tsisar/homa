@@ -85,6 +85,8 @@ afplay reply.wav
 | `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables |
 | `ADDR`             | `:8080`                                                               |
 | `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                       |
+| `LOG_LEVEL`        | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down |
+| `LOG_TIMEZONE`     | host local; e.g. `Asia/Dubai` — timestamp zone for logs              |
 
 ### Switching to Chatterbox (expressive) later
 

@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,6 +29,8 @@ import (
 	"agent/internal/lemonade"
 	"agent/internal/mcp"
 	"agent/internal/tts"
+
+	"github.com/tsisar/extended-log-go/log"
 )
 
 type config struct {
@@ -86,7 +87,6 @@ type toolExecutor interface {
 }
 
 func main() {
-	log.SetFlags(log.Ltime)
 	once := flag.String("once", "", "one-shot: send this text to the LLM, print and play the reply")
 	say := flag.String("say", "", "speak this text locally via TTS (no LLM)")
 	flag.Parse()
@@ -315,7 +315,7 @@ func (a *agent) serve() {
 
 	log.Printf("Homa %s listening on %s (LLM=%s, TTS=%s voice=%s)", version, a.cfg.addr, a.cfg.chatModel, a.cfg.ttsModel, a.cfg.ttsVoice)
 	if err := http.ListenAndServe(a.cfg.addr, mux); err != nil {
-		log.Fatal(err)
+		log.Fatalf("%v", err)
 	}
 }
 

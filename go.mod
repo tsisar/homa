@@ -2,7 +2,10 @@ module agent
 
 go 1.25.5
 
-require github.com/mark3labs/mcp-go v0.54.1
+require (
+	github.com/mark3labs/mcp-go v0.54.1
+	github.com/tsisar/extended-log-go v1.2.4
+)
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

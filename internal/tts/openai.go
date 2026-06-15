@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/tsisar/extended-log-go/log"
 )
 
 // OpenAISpeech calls POST {BaseURL}/audio/speech and returns the audio bytes
@@ -64,6 +66,9 @@ func (s *OpenAISpeech) Speak(ctx context.Context, text string) ([]byte, string, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Trace: TTS request metadata only — skip the synthesized audio (response is a blob).
+	log.Tracef("[tts] request: model=%s voice=%s format=%s input=%dB", s.Model, s.Voice, s.Format, len(text))
+
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("speech request: %w", err)
@@ -71,6 +76,8 @@ func (s *OpenAISpeech) Speak(ctx context.Context, text string) ([]byte, string, 
 	defer resp.Body.Close()
 
 	data, _ := io.ReadAll(resp.Body)
+	// Trace: TTS response — size + status only, never the raw audio bytes.
+	log.Tracef("[tts] response: http=%d audio=%dB", resp.StatusCode, len(data))
 	if resp.StatusCode != http.StatusOK {
 		// Error responses are JSON; surface them rather than the raw audio path.
 		return nil, "", fmt.Errorf("tts http %d: %s", resp.StatusCode, snippet(data))
