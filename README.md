@@ -1,0 +1,145 @@
+# Homa
+
+**Homa** — *Home Orchestration & Monitoring Assistant*. A small Go voice
+assistant for the home and homelab: it listens, thinks, searches the web, and
+talks back. The brain, ears and default voice run on a local
+[Lemonade Server](https://lemonade-server.ai); web search runs as an MCP tool
+behind the homelab gateway.
+
+```
+you ──speak/text──▶ Homa (Go)
+                      │  chat  ─▶ Lemonade /chat/completions  (Qwen3.6-35B-A3B, thinking off)
+                      │  tools ─▶ MCP gateway (kgateway) ─▶ ddgo-mcp: web_search / web_fetch
+                      │  voice ─▶ Lemonade /audio/speech     (Kokoro, voice af_heart)
+                      ▼
+                   audio reply  ("Let me look that up." → … → answer)
+
+mic path (ESP32 client): wav ─▶ Lemonade /audio/transcriptions (Whisper) ─▶ text
+```
+
+The LLM, STT and TTS are reached over the OpenAI-compatible API, so swapping a
+model or the TTS server (e.g. Chatterbox on a Mac for a more expressive voice)
+is a config change, not a code change.
+
+## Prerequisites
+
+- Go 1.25+
+- macOS (`afplay` is used for local playback)
+- A reachable Lemonade Server with these models pulled:
+    - chat: `Qwen3.6-35B-A3B-MTP-GGUF` (default; any chat model works)
+    - TTS: `kokoro-v1`
+    - STT: `Whisper-Large-v3-Turbo`
+    - default URL `http://192.168.88.83:8000/api/v1`
+
+No local setup needed for English — Kokoro runs on the Lemonade box.
+
+## Run
+
+```sh
+# one-shot: ask, print + play the spoken reply
+go run . -once "Who are you?"
+
+# speak arbitrary text locally (no LLM)
+go run . -say "Testing the voice."
+
+# with web search enabled
+MCP_URL=http://mcp.tsisar.local/ MCP_ALLOW="web_*" go run . -once "What's the weather in Kyiv?"
+
+# HTTP server (this is what the ESP32 will talk to)
+go run .
+```
+
+### HTTP endpoints
+
+| Method & path     | Body                       | Response                                               |
+|-------------------|----------------------------|--------------------------------------------------------|
+| `GET  /healthz`   | —                          | `ok`                                                   |
+| `POST /api/talk`  | `{"text":"..."}`           | audio reply; `X-Reply-Text` (+ `X-Filler-Text`) header |
+| `POST /api/say`   | `{"text":"..."}`           | audio (TTS only)                                       |
+| `POST /api/stt`   | multipart `file` = PCM WAV | `{"text":"..."}` (Whisper)                             |
+| `POST /api/reset` | —                          | clears conversation history                            |
+
+```sh
+curl -X POST localhost:8080/api/talk -d '{"text":"Tell me a joke"}' -o reply.wav -D - | grep -i x-reply
+afplay reply.wav
+```
+
+## Configuration (env vars)
+
+| Var                | Default                                                               |
+|--------------------|-----------------------------------------------------------------------|
+| `LEMONADE_URL`     | `http://192.168.88.83:8000/api/v1`                                    |
+| `CHAT_MODEL`       | `Qwen3.6-35B-A3B-MTP-GGUF`                                            |
+| `STT_MODEL`        | `Whisper-Large-v3-Turbo`                                              |
+| `TTS_URL`          | = `LEMONADE_URL` (Kokoro on Lemonade)                                 |
+| `TTS_MODEL`        | `kokoro-v1`                                                           |
+| `TTS_VOICE`        | `af_heart` (warm female; `am_michael`, `bf_emma`)                     |
+| `TTS_FORMAT`       | `wav`                                                                 |
+| `DISABLE_THINKING` | `true`                                                                |
+| `MCP_URL`          | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                 |
+| `MCP_ALLOW`        | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`             |
+| `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables |
+| `ADDR`             | `:8080`                                                               |
+| `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                       |
+
+### Switching to Chatterbox (expressive) later
+
+Run Chatterbox-TTS-Server (OpenAI-compatible) on the Mac and point Homa at it —
+no code change:
+
+```sh
+TTS_URL=http://localhost:8004/v1 TTS_MODEL=chatterbox TTS_VOICE=<voice> go run .
+```
+
+## Web search via MCP
+
+Homa can call tools exposed by an MCP server over **Streamable HTTP**. Point it
+at one with `MCP_URL` and pick which tools the model may see with `MCP_ALLOW`.
+
+Search is provided by **[ddgo-mcp](https://github.com/tsisar/ddgo-mcp)** — a tiny
+Go MCP server (`search` + `fetch`; DuckDuckGo + readability, no API key, no
+browser) deployed in the k3s homelab behind the kgateway/agentgateway MCP
+gateway as target `web`. The gateway federates several MCP backends behind one
+endpoint and namespaces tools as `<target>_<tool>`, so ddgo-mcp's tools appear
+as `web_search` / `web_fetch` alongside `grafana_*`, `postgres_*`, etc.
+
+```sh
+MCP_URL=http://mcp.tsisar.local/ MCP_ALLOW="web_*" go run .
+```
+
+How it works:
+
+- `respond()` runs the tool-use loop: send `tools` → on `tool_calls`, call each
+  via `internal/mcp` and feed back a `role:"tool"` message → repeat (≤5 rounds,
+  then answer without tools).
+- When Homa first decides to use a tool it speaks a short filler (`SEARCH_FILLER`,
+  e.g. "Let me look that up.") to mask tool latency. The CLI plays it immediately;
+  `/api/talk` returns it in the `X-Filler-Text` header. (On the ESP32 it becomes
+  a first audio segment over the future WebSocket.)
+- **Security:** `MCP_ALLOW` is an explicit allow-list (exact names, `prefix*`
+  glob, or `*`); empty = no tools. Keep it tight — the gateway also fronts
+  dangerous tools (`postgres_execute_sql`, dashboard writes) a voice assistant
+  should not reach.
+
+## Notes
+
+- `Qwen3.6-35B-A3B` is a reasoning model: it emits chain-of-thought in
+  `reasoning_content` and leaves `content` empty unless thinking is disabled.
+  Homa sends `chat_template_kwargs.enable_thinking=false` (toggle with
+  `DISABLE_THINKING`). Without it the reply is empty.
+- Kokoro audio is 24000 Hz mono; Lemonade returns it as float WAV, passed
+  through to clients / `afplay` as-is.
+
+## Parked: Ukrainian
+
+Ukrainian voice is on hold (Kokoro has no Ukrainian; the Piper `uk_UA` voice had
+poor prosody). `scripts/setup.sh`, `.venv/`, and `voices/` are leftovers from
+that path and are unused by the English build.
+
+## Next: ESP32 client
+
+Target device: Waveshare ESP32-C6 Touch AMOLED 2.16 (ES8311 codec, dual mic,
+speaker). Planned flow: push-to-talk on the touchscreen → record mic via I2S →
+`POST /api/stt` → `POST /api/talk` → play the returned audio through the speaker.
+"Homa" becomes the wake word and a single WebSocket (streaming the filler then
+the answer) is the later upgrade.

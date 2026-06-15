@@ -27,6 +27,7 @@ voices/*.onnx.json
 
 # ── Editor / OS / local agent config ─────────────────────────────
 /.idea/
+*.iml
 .vscode/
 .DS_Store
 /.claude/
