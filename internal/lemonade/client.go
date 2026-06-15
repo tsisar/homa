@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/tsisar/extended-log-go/log"
@@ -47,11 +48,22 @@ func New(baseURL string) *Client {
 
 // Message is a single chat turn. For an assistant turn that calls tools,
 // ToolCalls is set; for a tool result, Role=="tool" and ToolCallID is set.
+// Images, when present, are sent alongside Content as multimodal parts — used
+// for tool results that return a picture (e.g. a rendered Grafana panel) so a
+// vision model can read them.
 type Message struct {
 	Role       string
 	Content    string
 	ToolCalls  []ToolCall
 	ToolCallID string
+	Images     []Image
+}
+
+// Image is an inline image attached to a message. Data is base64-encoded (no
+// data: prefix); MIME is like "image/png".
+type Image struct {
+	MIME string
+	Data string
 }
 
 // Tool is a function the model may call (OpenAI tool schema).
@@ -102,9 +114,19 @@ type wireToolCall struct {
 
 type wireMessage struct {
 	Role       string         `json:"role"`
-	Content    string         `json:"content,omitempty"`
+	Content    any            `json:"content,omitempty"` // string, or []wireContentPart when images are attached
 	ToolCalls  []wireToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+type wireImageURL struct {
+	URL string `json:"url"`
+}
+
+type wireContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *wireImageURL `json:"image_url,omitempty"`
 }
 
 type wireToolFunc struct {
@@ -183,8 +205,9 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Trace: full request to the model (mirrors alert-agent's llm clients).
-	log.Tracef("[llm] request: %s", body)
+	// Trace: full request to the model (mirrors alert-agent's llm clients), with
+	// inline image payloads elided so a rendered panel doesn't flood the log.
+	log.Tracef("[llm] request: %s", redactImages(body))
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
@@ -243,7 +266,24 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 func toWire(msgs []Message) []wireMessage {
 	out := make([]wireMessage, len(msgs))
 	for i, m := range msgs {
-		wm := wireMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		wm := wireMessage{Role: m.Role, ToolCallID: m.ToolCallID}
+		switch {
+		case len(m.Images) > 0:
+			// Multimodal: emit a content array of text + image parts.
+			parts := make([]wireContentPart, 0, len(m.Images)+1)
+			if m.Content != "" {
+				parts = append(parts, wireContentPart{Type: "text", Text: m.Content})
+			}
+			for _, img := range m.Images {
+				parts = append(parts, wireContentPart{
+					Type:     "image_url",
+					ImageURL: &wireImageURL{URL: "data:" + img.MIME + ";base64," + img.Data},
+				})
+			}
+			wm.Content = parts
+		case m.Content != "":
+			wm.Content = m.Content
+		}
 		for _, tc := range m.ToolCalls {
 			wm.ToolCalls = append(wm.ToolCalls, wireToolCall{
 				ID:       tc.ID,
@@ -308,6 +348,18 @@ func (c *Client) Transcribe(ctx context.Context, model string, wav []byte, lang 
 		return "", fmt.Errorf("lemonade http %d: %s", resp.StatusCode, snippet(data))
 	}
 	return strings.TrimSpace(tr.Text), nil
+}
+
+// dataURIRe matches a base64 image data URI value inside JSON so its payload can
+// be elided from trace logs (keeping the "data:<mime>;base64," prefix).
+var dataURIRe = regexp.MustCompile(`("url":"data:[^"]*?base64,)[A-Za-z0-9+/=]+"`)
+
+// redactImages strips base64 image payloads from a marshaled request for logging.
+func redactImages(b []byte) string {
+	if !bytes.Contains(b, []byte("base64,")) {
+		return string(b)
+	}
+	return string(dataURIRe.ReplaceAll(b, []byte(`$1…"`)))
 }
 
 // mentionsContextLimit reports whether s reads like a context-window overflow.

@@ -70,12 +70,13 @@ func (e *Executor) connect(ctx context.Context) error {
 // Tools returns the allow-listed tools to advertise to the LLM.
 func (e *Executor) Tools() []lemonade.Tool { return e.tools }
 
-// CallTool invokes a tool by name with raw-JSON arguments and returns its text.
-func (e *Executor) CallTool(ctx context.Context, name, argsJSON string) (string, error) {
+// CallTool invokes a tool by name with raw-JSON arguments and returns its text
+// plus any images it produced (e.g. a rendered Grafana panel).
+func (e *Executor) CallTool(ctx context.Context, name, argsJSON string) (string, []lemonade.Image, error) {
 	var args map[string]any
 	if s := strings.TrimSpace(argsJSON); s != "" {
 		if err := json.Unmarshal([]byte(s), &args); err != nil {
-			return "", fmt.Errorf("bad tool arguments: %w", err)
+			return "", nil, fmt.Errorf("bad tool arguments: %w", err)
 		}
 	}
 
@@ -88,13 +89,13 @@ func (e *Executor) CallTool(ctx context.Context, name, argsJSON string) (string,
 
 	res, err := e.client.CallTool(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("call %q: %w", name, err)
+		return "", nil, fmt.Errorf("call %q: %w", name, err)
 	}
-	text := extractText(res)
+	text, images := extractContent(res)
 	if res.IsError {
-		return "", fmt.Errorf("tool %q reported error: %s", name, text)
+		return "", nil, fmt.Errorf("tool %q reported error: %s", name, text)
 	}
-	return text, nil
+	return text, images, nil
 }
 
 func (e *Executor) Close() error {
@@ -115,17 +116,22 @@ func convertTool(t mcp.Tool) lemonade.Tool {
 	return lemonade.Tool{Name: t.Name, Description: t.Description, Parameters: params}
 }
 
-func extractText(res *mcp.CallToolResult) string {
+func extractContent(res *mcp.CallToolResult) (string, []lemonade.Image) {
 	var b strings.Builder
+	var images []lemonade.Image
 	for _, c := range res.Content {
 		if tc, ok := c.(mcp.TextContent); ok {
 			if b.Len() > 0 {
 				b.WriteString("\n")
 			}
 			b.WriteString(tc.Text)
+			continue
+		}
+		if ic, ok := mcp.AsImageContent(c); ok {
+			images = append(images, lemonade.Image{MIME: ic.MIMEType, Data: ic.Data})
 		}
 	}
-	return b.String()
+	return b.String(), images
 }
 
 // matchAllow reports whether a tool name is permitted. Supports exact names,

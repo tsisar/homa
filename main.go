@@ -94,7 +94,7 @@ var version = "dev"
 // toolExecutor is satisfied by *mcp.Executor.
 type toolExecutor interface {
 	Tools() []lemonade.Tool
-	CallTool(ctx context.Context, name, argsJSON string) (string, error)
+	CallTool(ctx context.Context, name, argsJSON string) (string, []lemonade.Image, error)
 }
 
 func main() {
@@ -278,19 +278,23 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 			a.history = append(a.history, lemonade.Message{Role: "assistant", Content: res.Content, ToolCalls: res.ToolCalls})
 			a.mu.Unlock()
 			for _, tc := range res.ToolCalls {
-				out, callErr := a.tools.CallTool(ctx, tc.Name, tc.Arguments)
+				out, imgs, callErr := a.tools.CallTool(ctx, tc.Name, tc.Arguments)
 				if callErr != nil {
 					out = "error: " + callErr.Error()
 				}
 				if strings.TrimSpace(out) == "" {
-					out = "(no output)"
+					if len(imgs) > 0 {
+						out = "(image returned)"
+					} else {
+						out = "(no output)"
+					}
 				}
-				log.Printf("tool %s(%s) -> %d chars", tc.Name, truncate(tc.Arguments, 100), len(out))
+				log.Printf("tool %s(%s) -> %d chars, %d image(s)", tc.Name, truncate(tc.Arguments, 100), len(out), len(imgs))
 				// Cap the live message: proactive compaction only runs before the
 				// loop, so a single runaway page must not blow the window mid-turn.
 				out = clampText(out, a.cfg.toolOutputLimit)
 				a.mu.Lock()
-				a.history = append(a.history, lemonade.Message{Role: "tool", ToolCallID: tc.ID, Content: out})
+				a.history = append(a.history, lemonade.Message{Role: "tool", ToolCallID: tc.ID, Content: out, Images: imgs})
 				a.mu.Unlock()
 			}
 			continue
@@ -308,6 +312,7 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 	a.mu.Lock()
 	a.history = append(a.history, lemonade.Message{Role: "assistant", Content: reply})
 	a.mu.Unlock()
+	a.stripImages() // the model has answered; don't re-send the (large) image next turn
 
 	audio, mime, err := a.tts.SpeakAs(ctx, reply, ttsFormat)
 	if err != nil {
@@ -459,7 +464,36 @@ func (a *agent) truncateOversized() bool {
 		a.summary = clampText(a.summary, summaryCharLimit)
 		changed = true
 	}
+	if !changed {
+		// Nothing textual left to shed: drop inline images (the heaviest payload)
+		// so the retry can fit rather than wedge.
+		for i := range a.history {
+			if len(a.history[i].Images) > 0 {
+				a.history[i].Images = nil
+				if strings.TrimSpace(a.history[i].Content) == "" {
+					a.history[i].Content = "(image dropped to fit context)"
+				}
+				changed = true
+			}
+		}
+	}
 	return changed
+}
+
+// stripImages drops inline images from history once a turn is done. A rendered
+// panel is large and only needed while the model forms its reply; keeping it
+// would re-send the whole image on every later turn and undo the context bound.
+func (a *agent) stripImages() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.history {
+		if len(a.history[i].Images) > 0 {
+			a.history[i].Images = nil
+			if strings.TrimSpace(a.history[i].Content) == "" {
+				a.history[i].Content = "(image was shown to the assistant)"
+			}
+		}
+	}
 }
 
 // clampText trims s to at most limit bytes, marking the cut. The result is

@@ -147,6 +147,13 @@ How it works:
   e.g. "Let me look that up.") to mask tool latency. The CLI plays it immediately;
   `/api/talk` returns it in the `X-Filler-Text` header. (On the ESP32 it becomes
   a first audio segment over the future WebSocket.)
+- **Images:** a tool result that returns a picture (e.g. `grafana_get_panel_image`)
+  is passed to the model as an inline `image_url` part, so a vision-capable chat
+  model can read it — Homa can answer "what does this panel show" off a rendered
+  Grafana panel. The image is kept only for the turn that fetched it and then
+  stripped from history (a panel PNG is large; re-sending it every turn would
+  blow the context). Requires a vision model served with multimodal support; a
+  text-only model will just ignore the image.
 - **Security:** `MCP_ALLOW` is an explicit allow-list (exact names or a trailing
   `prefix*` glob — no other wildcards; `*` = everything); empty = no tools. Keep
   it tight — the gateway also fronts tools a voice assistant should never reach:
