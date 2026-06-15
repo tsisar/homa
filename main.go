@@ -33,8 +33,7 @@ import (
 )
 
 type config struct {
-	lemonadeURL     string // direct Lemonade, used for STT + TTS (the LLM gateway is chat-only)
-	chatURL         string // chat-completions endpoint — the kgateway LLM gateway, local provider
+	apiURL          string // single OpenAI-compatible endpoint for chat + STT + TTS (the LLM gateway, local provider)
 	chatModel       string
 	sttModel        string
 	ttsURL          string
@@ -50,13 +49,15 @@ type config struct {
 }
 
 func loadConfig() config {
-	lem := envOr("LEMONADE_URL", "http://192.168.88.83:8000/api/v1")
+	// One endpoint for everything. Defaults to the LLM gateway (local provider),
+	// which now fronts audio (TTS/STT) as well as chat; point API_URL straight at
+	// Lemonade (http://192.168.88.83:8000/api/v1) for local/offline runs.
+	api := envOr("API_URL", "http://llm.tsisar.local/local/v1")
 	return config{
-		lemonadeURL:     lem,
-		chatURL:         envOr("CHAT_URL", "http://llm.tsisar.local/local/v1"), // gateway, local provider
+		apiURL:          api,
 		chatModel:       envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
 		sttModel:        envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
-		ttsURL:          envOr("TTS_URL", lem),
+		ttsURL:          envOr("TTS_URL", api), // optional override (e.g. Chatterbox); defaults to API_URL
 		ttsModel:        envOr("TTS_MODEL", "kokoro-v1"),
 		ttsVoice:        envOr("TTS_VOICE", "af_heart"),
 		ttsFormat:       envOr("TTS_FORMAT", "wav"),
@@ -93,14 +94,13 @@ func main() {
 	cfg := loadConfig()
 	ag := &agent{
 		cfg: cfg,
-		llm: lemonade.New(cfg.chatURL),     // chat via the kgateway LLM gateway (local provider)
-		stt: lemonade.New(cfg.lemonadeURL), // STT direct to Lemonade (gateway is chat-only)
+		lem: lemonade.New(cfg.apiURL), // chat + STT, both via the single endpoint
 		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat),
 	}
 	if cfg.disableThinking {
 		// Qwen3-family models reason into reasoning_content and leave content
 		// empty unless thinking is disabled — fatal for a voice loop.
-		ag.llm.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+		ag.lem.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
 	}
 	if cfg.mcpURL != "" {
 		ex, err := mcp.New(context.Background(), cfg.mcpURL, cfg.mcpAllow)
@@ -148,8 +148,7 @@ func main() {
 
 type agent struct {
 	cfg   config
-	llm   *lemonade.Client // chat (via the LLM gateway)
-	stt   *lemonade.Client // transcription (direct to Lemonade)
+	lem   *lemonade.Client // chat + transcription, both via the single endpoint
 	tts   *tts.OpenAISpeech
 	tools toolExecutor // nil when MCP is disabled
 
@@ -193,7 +192,7 @@ func (a *agent) respond(ctx context.Context, userText string, onFiller func(stri
 			offer = nil
 		}
 
-		res, err := a.llm.Chat(ctx, a.cfg.chatModel, msgs, offer)
+		res, err := a.lem.Chat(ctx, a.cfg.chatModel, msgs, offer)
 		if err != nil {
 			return "", nil, "", fmt.Errorf("llm: %w", err)
 		}
@@ -299,7 +298,7 @@ func (a *agent) serve() {
 		wav, _ := io.ReadAll(f)
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		text, err := a.stt.Transcribe(ctx, a.cfg.sttModel, wav, "en")
+		text, err := a.lem.Transcribe(ctx, a.cfg.sttModel, wav, "en")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return

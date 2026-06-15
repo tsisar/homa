@@ -8,14 +8,17 @@ behind the homelab gateway.
 
 ```
 you ──speak/text──▶ Homa (Go)
-                      │  chat  ─▶ Lemonade /chat/completions  (Qwen3.6-35B-A3B, thinking off)
+                      │  chat  ─▶ LLM gateway /chat/completions   ─▶ Lemonade (Qwen3.6-35B-A3B, thinking off)
                       │  tools ─▶ MCP gateway (kgateway) ─▶ ddgo-mcp: web_search / web_fetch
-                      │  voice ─▶ Lemonade /audio/speech     (Kokoro, voice af_heart)
+                      │  voice ─▶ LLM gateway /audio/speech       ─▶ Lemonade (Kokoro, voice af_heart)
                       ▼
                    audio reply  ("Let me look that up." → … → answer)
 
-mic path (ESP32 client): wav ─▶ Lemonade /audio/transcriptions (Whisper) ─▶ text
+mic path (ESP32 client): wav ─▶ LLM gateway /audio/transcriptions ─▶ Lemonade (Whisper) ─▶ text
 ```
+
+Chat, STT and TTS all share **one** endpoint (`API_URL`) — the LLM gateway's
+`local` provider, which fronts Lemonade for both chat and audio.
 
 The LLM, STT and TTS are reached over the OpenAI-compatible API, so swapping a
 model or the TTS server (e.g. Chatterbox on a Mac for a more expressive voice)
@@ -29,7 +32,8 @@ is a config change, not a code change.
     - chat: `Qwen3.6-35B-A3B-MTP-GGUF` (default; any chat model works)
     - TTS: `kokoro-v1`
     - STT: `Whisper-Large-v3-Turbo`
-    - default URL `http://192.168.88.83:8000/api/v1`
+    - reached via `API_URL` — the LLM gateway (`http://llm.tsisar.local/local/v1`,
+      default) or Lemonade directly (`http://192.168.88.83:8000/api/v1`)
 
 No local setup needed for English — Kokoro runs on the Lemonade box.
 
@@ -68,11 +72,10 @@ afplay reply.wav
 
 | Var                | Default                                                               |
 |--------------------|-----------------------------------------------------------------------|
-| `CHAT_URL`         | `http://llm.tsisar.local/local/v1` — chat via the kgateway LLM gateway (local provider) |
-| `LEMONADE_URL`     | `http://192.168.88.83:8000/api/v1` — direct Lemonade, used for STT + TTS |
+| `API_URL`          | `http://llm.tsisar.local/local/v1` — single endpoint for chat + STT + TTS (LLM gateway, local provider). Set to `http://192.168.88.83:8000/api/v1` to hit Lemonade directly |
 | `CHAT_MODEL`       | `Qwen3.6-35B-A3B-MTP-GGUF`                                            |
 | `STT_MODEL`        | `Whisper-Large-v3-Turbo`                                              |
-| `TTS_URL`          | = `LEMONADE_URL` (Kokoro on Lemonade)                                 |
+| `TTS_URL`          | = `API_URL` (optional override, e.g. Chatterbox on a Mac)             |
 | `TTS_MODEL`        | `kokoro-v1`                                                           |
 | `TTS_VOICE`        | `af_heart` (warm female; `am_michael`, `bf_emma`)                     |
 | `TTS_FORMAT`       | `wav`                                                                 |
@@ -124,11 +127,13 @@ How it works:
 
 ## Notes
 
-- **Routing:** chat completions go through the kgateway LLM gateway (`CHAT_URL`,
-  `local` provider — Homa uses only local models, never the gateway's OpenAI /
-  Anthropic providers). STT and TTS go **direct to Lemonade** (`LEMONADE_URL`)
-  because the LLM gateway fronts chat only. The gateway preserves
-  `chat_template_kwargs` (thinking-disable) and tool calls.
+- **Routing:** chat, STT and TTS all go through the kgateway LLM gateway via a
+  single `API_URL` (`local` provider — Homa uses only local models, never the
+  gateway's OpenAI / Anthropic providers). Chat hits the `local` AI backend;
+  `/audio/*` rides a static passthrough backend on the same gateway (the AI
+  backend only speaks chat-completions and 503s on audio). The gateway preserves
+  `chat_template_kwargs` (thinking-disable) and tool calls. Point `API_URL`
+  straight at Lemonade to bypass the gateway entirely.
 - `Qwen3.6-35B-A3B` is a reasoning model: it emits chain-of-thought in
   `reasoning_content` and leaves `content` empty unless thinking is disabled.
   Homa sends `chat_template_kwargs.enable_thinking=false` (toggle with

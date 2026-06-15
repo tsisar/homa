@@ -13,8 +13,9 @@ import (
 	"strings"
 )
 
-// Client talks to a Lemonade Server. BaseURL is e.g.
-// "http://192.168.88.83:8000/api/v1". No auth on the target instance.
+// Client talks to a Lemonade Server (directly or via the LLM gateway, which
+// proxies the same OpenAI-compatible API). BaseURL is e.g.
+// "http://llm.tsisar.local/local/v1". No auth on the target instance.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
