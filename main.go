@@ -40,6 +40,7 @@ type config struct {
 	apiURL          string // single OpenAI-compatible endpoint for chat + STT + TTS (the LLM gateway, local provider)
 	chatModel       string
 	sttModel        string
+	sttLang         string // Whisper language hint; "" = auto-detect the spoken language
 	ttsURL          string
 	ttsModel        string
 	ttsVoice        string
@@ -65,6 +66,7 @@ func loadConfig() config {
 		apiURL:       api,
 		chatModel:    envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
 		sttModel:     envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
+		sttLang:      envOr("STT_LANG", ""), // empty = auto-detect (don't force English)
 		ttsURL:       envOr("TTS_URL", api), // optional override (e.g. Chatterbox); defaults to API_URL
 		ttsModel:     envOr("TTS_MODEL", "kokoro-v1"),
 		ttsVoice:     envOr("TTS_VOICE", "af_heart"),
@@ -651,7 +653,7 @@ func (a *agent) serve() {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
-		text, err := a.lem.Transcribe(ctx, a.cfg.sttModel, wav, "en")
+		text, err := a.lem.Transcribe(ctx, a.cfg.sttModel, wav, a.cfg.sttLang)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
