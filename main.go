@@ -44,7 +44,7 @@ type config struct {
 	ttsModel        string
 	ttsVoice        string
 	ttsFormat       string
-	disableThinking bool
+	thinking        bool // reasoning enabled; default off — Qwen3 returns empty content with it on
 	mcpURL          string
 	mcpAllow        []string
 	searchFiller    string
@@ -62,19 +62,19 @@ func loadConfig() config {
 	// Lemonade (http://192.168.88.83:8000/api/v1) for local/offline runs.
 	api := envOr("API_URL", "http://llm.tsisar.local/local/v1")
 	return config{
-		apiURL:          api,
-		chatModel:       envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
-		sttModel:        envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
-		ttsURL:          envOr("TTS_URL", api), // optional override (e.g. Chatterbox); defaults to API_URL
-		ttsModel:        envOr("TTS_MODEL", "kokoro-v1"),
-		ttsVoice:        envOr("TTS_VOICE", "af_heart"),
-		ttsFormat:       envOr("TTS_FORMAT", "wav"),
-		disableThinking: envOr("DISABLE_THINKING", "true") == "true",
-		mcpURL:          envOr("MCP_URL", ""), // empty = MCP disabled
-		mcpAllow:        splitCSV(envOr("MCP_ALLOW", "")),
-		searchFiller:    envOr("SEARCH_FILLER", "Let me look that up."), // spoken before tools run; empty = off
-		addr:            envOr("ADDR", ":8080"),
-		systemPrompt:    envOr("SYSTEM_PROMPT", defaultSystemPrompt),
+		apiURL:       api,
+		chatModel:    envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
+		sttModel:     envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
+		ttsURL:       envOr("TTS_URL", api), // optional override (e.g. Chatterbox); defaults to API_URL
+		ttsModel:     envOr("TTS_MODEL", "kokoro-v1"),
+		ttsVoice:     envOr("TTS_VOICE", "af_heart"),
+		ttsFormat:    envOr("TTS_FORMAT", "wav"),
+		thinking:     envOr("THINKING", "false") == "true",
+		mcpURL:       envOr("MCP_URL", ""), // empty = MCP disabled
+		mcpAllow:     splitCSV(envOr("MCP_ALLOW", "")),
+		searchFiller: envOr("SEARCH_FILLER", "Let me look that up."), // spoken before tools run; empty = off
+		addr:         envOr("ADDR", ":8080"),
+		systemPrompt: envOr("SYSTEM_PROMPT", defaultSystemPrompt),
 		// CONTEXT_TOKENS must match the backend's served context (llama-server
 		// -c / --ctx-size). The default mirrors a conservative 4096 window.
 		contextTokens:   envInt("CONTEXT_TOKENS", 4096),
@@ -114,12 +114,12 @@ func main() {
 		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat),
 	}
 	ag.lem.MaxTokens = cfg.maxTokens
-	if cfg.disableThinking {
+	if cfg.thinking {
+		log.Printf("warning: THINKING is on — a Qwen3-family model will reason into reasoning_content and reply with empty content (no speech). Leave THINKING off (the default) unless the chat model is non-reasoning.")
+	} else {
 		// Qwen3-family models reason into reasoning_content and leave content
 		// empty unless thinking is disabled — fatal for a voice loop.
 		ag.lem.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
-	} else {
-		log.Printf("warning: DISABLE_THINKING is off — a Qwen3-family model will reason into reasoning_content and reply with empty content (no speech). Set DISABLE_THINKING=true unless the chat model is non-reasoning.")
 	}
 	if cfg.mcpURL != "" {
 		ex, err := mcp.New(context.Background(), cfg.mcpURL, cfg.mcpAllow)

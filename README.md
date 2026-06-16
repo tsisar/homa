@@ -79,7 +79,7 @@ afplay reply.wav
 | `TTS_MODEL`         | `kokoro-v1`                                                                                                                                                                 |
 | `TTS_VOICE`         | `af_heart` (warm female; `am_michael`, `bf_emma`)                                                                                                                           |
 | `TTS_FORMAT`        | `wav`                                                                                                                                                                       |
-| `DISABLE_THINKING`  | `true`                                                                                                                                                                      |
+| `THINKING`         | `false` — reasoning off by default; a Qwen3 model replies empty with it on. Set `true` only for a non-reasoning chat model                                                  |
 | `MCP_URL`           | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
 | `MCP_ALLOW`         | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
 | `SEARCH_FILLER`     | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
@@ -184,8 +184,9 @@ How it works:
   straight at Lemonade to bypass the gateway entirely.
 - `Qwen3.6-35B-A3B` is a reasoning model: it emits chain-of-thought in
   `reasoning_content` and leaves `content` empty unless thinking is disabled.
-  Homa sends `chat_template_kwargs.enable_thinking=false` (toggle with
-  `DISABLE_THINKING`). Without it the reply is empty.
+  Homa disables it by default (`chat_template_kwargs.enable_thinking=false`);
+  set `THINKING=true` only for a non-reasoning chat model. With reasoning on,
+  this model replies empty.
 - Kokoro audio is 24000 Hz mono; Lemonade returns it as float WAV, passed
   through to clients / `afplay` as-is.
 - **Context management:** the conversation is sent in full every turn, so it
