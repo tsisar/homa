@@ -118,6 +118,8 @@ func main() {
 		// Qwen3-family models reason into reasoning_content and leave content
 		// empty unless thinking is disabled — fatal for a voice loop.
 		ag.lem.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+	} else {
+		log.Printf("warning: DISABLE_THINKING is off — a Qwen3-family model will reason into reasoning_content and reply with empty content (no speech). Set DISABLE_THINKING=true unless the chat model is non-reasoning.")
 	}
 	if cfg.mcpURL != "" {
 		ex, err := mcp.New(context.Background(), cfg.mcpURL, cfg.mcpAllow)
@@ -587,6 +589,7 @@ func (a *agent) serve() {
 		// raw 16-bit pcm); empty falls back to the configured TTS_FORMAT.
 		reply, audio, mime, err := a.respond(ctx, text, r.URL.Query().Get("format"), func(t string) { filler = t })
 		if err != nil {
+			log.Printf("talk %q failed: %v", text, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
