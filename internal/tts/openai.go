@@ -7,9 +7,11 @@ package tts
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
@@ -60,11 +62,19 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 		return nil, "", fmt.Errorf("tts: empty text")
 	}
 
+	// The ESP32 plays raw 16-bit PCM, but not every backend emits "pcm"
+	// (StyleTTS2 only does wav/mp3). For a pcm request, fetch wav and strip it to
+	// raw PCM ourselves — works against any wav-capable backend.
+	backendFormat, toPCM := format, format == "pcm"
+	if toPCM {
+		backendFormat = "wav"
+	}
+
 	body, err := json.Marshal(speechRequest{
 		Model:          s.Model,
 		Input:          text,
 		Voice:          s.Voice,
-		ResponseFormat: format,
+		ResponseFormat: backendFormat,
 	})
 	if err != nil {
 		return nil, "", err
@@ -77,7 +87,7 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 	req.Header.Set("Content-Type", "application/json")
 
 	// Trace: TTS request metadata only — skip the synthesized audio (response is a blob).
-	log.Tracef("[tts] request: model=%s voice=%s format=%s input=%dB", s.Model, s.Voice, format, len(text))
+	log.Tracef("[tts] request: model=%s voice=%s format=%s input=%dB", s.Model, s.Voice, backendFormat, len(text))
 
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
@@ -93,11 +103,74 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 		return nil, "", fmt.Errorf("tts http %d: %s", resp.StatusCode, snippet(data))
 	}
 
+	if toPCM {
+		pcm, err := wavToPCM16(data)
+		if err != nil {
+			return nil, "", fmt.Errorf("tts: wav->pcm: %w", err)
+		}
+		return pcm, "audio/l16", nil
+	}
+
 	mime := resp.Header.Get("Content-Type")
 	if mime == "" || strings.HasPrefix(mime, "application/json") {
 		mime = "audio/" + format
 	}
 	return data, mime, nil
+}
+
+// wavToPCM16 extracts mono 16-bit little-endian PCM from a WAV blob, converting
+// 32-bit float samples (e.g. Kokoro's WAV) to int16. Both StyleTTS2 (int16) and
+// Kokoro (float32) emit 24 kHz mono, which is what the ESP32 plays.
+func wavToPCM16(b []byte) ([]byte, error) {
+	if len(b) < 12 || string(b[0:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("not a WAV (%d bytes)", len(b))
+	}
+	var audioFormat, bits uint16
+	var data []byte
+	for off := 12; off+8 <= len(b); {
+		id := string(b[off : off+4])
+		sz := int(binary.LittleEndian.Uint32(b[off+4 : off+8]))
+		body := off + 8
+		end := body + sz
+		if end > len(b) {
+			end = len(b)
+		}
+		switch id {
+		case "fmt ":
+			if body+16 <= len(b) {
+				audioFormat = binary.LittleEndian.Uint16(b[body : body+2])
+				bits = binary.LittleEndian.Uint16(b[body+14 : body+16])
+			}
+		case "data":
+			data = b[body:end]
+		}
+		off = body + sz
+		if sz%2 == 1 { // chunks are word-aligned
+			off++
+		}
+	}
+	if data == nil {
+		return nil, fmt.Errorf("no data chunk")
+	}
+	switch {
+	case audioFormat == 1 && bits == 16:
+		return data, nil // already 16-bit PCM
+	case audioFormat == 3 && bits == 32:
+		out := make([]byte, len(data)/4*2)
+		for i, j := 0, 0; i+4 <= len(data); i, j = i+4, j+2 {
+			f := math.Float32frombits(binary.LittleEndian.Uint32(data[i : i+4]))
+			v := int32(f * 32767)
+			if v > 32767 {
+				v = 32767
+			} else if v < -32768 {
+				v = -32768
+			}
+			binary.LittleEndian.PutUint16(out[j:j+2], uint16(int16(v)))
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported WAV: format=%d bits=%d", audioFormat, bits)
+	}
 }
 
 func snippet(b []byte) string {
