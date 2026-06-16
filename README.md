@@ -70,27 +70,27 @@ afplay reply.wav
 
 ## Configuration (env vars)
 
-| Var                | Default                                                                                                                                                                     |
-|--------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `API_URL`          | `http://llm.tsisar.local/local/v1` — single endpoint for chat + STT + TTS (LLM gateway, local provider). Set to `http://192.168.88.83:8000/api/v1` to hit Lemonade directly |
-| `CHAT_MODEL`       | `Qwen3.6-35B-A3B-MTP-GGUF`                                                                                                                                                  |
-| `STT_MODEL`        | `Whisper-Large-v3-Turbo`                                                                                                                                                    |
-| `TTS_URL`          | = `API_URL` (optional override, e.g. Chatterbox on a Mac)                                                                                                                   |
-| `TTS_MODEL`        | `kokoro-v1`                                                                                                                                                                 |
-| `TTS_VOICE`        | `af_heart` (warm female; `am_michael`, `bf_emma`)                                                                                                                           |
-| `TTS_FORMAT`       | `wav`                                                                                                                                                                       |
-| `DISABLE_THINKING` | `true`                                                                                                                                                                      |
-| `MCP_URL`          | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
-| `MCP_ALLOW`        | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
-| `SEARCH_FILLER`    | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
-| `CONTEXT_TOKENS`   | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                        |
-| `MAX_TOKENS`       | `512` — reply budget reserved below `CONTEXT_TOKENS`                                                                                                                        |
-| `TOOL_OUTPUT_LIMIT`| `8000` — max chars a single tool result may add to live history                                                                                                             |
-| `MAX_TOOL_ROUNDS`  | `8` — tool-calling rounds before the model is nudged to answer in words                                                                                                     |
-| `ADDR`             | `:8080`                                                                                                                                                                     |
-| `SYSTEM_PROMPT`    | English, voice-optimized; sets the Homa persona                                                                                                                             |
-| `LOG_LEVEL`        | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down                                                             |
-| `LOG_TIMEZONE`     | host local; e.g. `Asia/Dubai` — timestamp zone for logs                                                                                                                     |
+| Var                 | Default                                                                                                                                                                     |
+|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `API_URL`           | `http://llm.tsisar.local/local/v1` — single endpoint for chat + STT + TTS (LLM gateway, local provider). Set to `http://192.168.88.83:8000/api/v1` to hit Lemonade directly |
+| `CHAT_MODEL`        | `Qwen3.6-35B-A3B-MTP-GGUF`                                                                                                                                                  |
+| `STT_MODEL`         | `Whisper-Large-v3-Turbo`                                                                                                                                                    |
+| `TTS_URL`           | = `API_URL` (optional override, e.g. Chatterbox on a Mac)                                                                                                                   |
+| `TTS_MODEL`         | `kokoro-v1`                                                                                                                                                                 |
+| `TTS_VOICE`         | `af_heart` (warm female; `am_michael`, `bf_emma`)                                                                                                                           |
+| `TTS_FORMAT`        | `wav`                                                                                                                                                                       |
+| `DISABLE_THINKING`  | `true`                                                                                                                                                                      |
+| `MCP_URL`           | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
+| `MCP_ALLOW`         | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
+| `SEARCH_FILLER`     | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
+| `CONTEXT_TOKENS`    | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                        |
+| `MAX_TOKENS`        | `512` — reply budget reserved below `CONTEXT_TOKENS`                                                                                                                        |
+| `TOOL_OUTPUT_LIMIT` | `8000` — max chars a single tool result may add to live history                                                                                                             |
+| `MAX_TOOL_ROUNDS`   | `8` — tool-calling rounds before the model is nudged to answer in words                                                                                                     |
+| `ADDR`              | `:8080`                                                                                                                                                                     |
+| `SYSTEM_PROMPT`     | English, voice-optimized; sets the Homa persona                                                                                                                             |
+| `LOG_LEVEL`         | `trace` (unset → trace) — `trace` logs full LLM requests/responses; `debug`/`info`/`warn`/`error` to quiet down                                                             |
+| `LOG_TIMEZONE`      | host local; e.g. `Asia/Dubai` — timestamp zone for logs                                                                                                                     |
 
 ### Switching to Chatterbox (expressive) later
 
@@ -139,6 +139,15 @@ curated subset, e.g.:
 ```sh
 MCP_ALLOW="web_*,grafana_query_prometheus,grafana_query_loki_logs,grafana_find_error_pattern_logs,grafana_list_alert_groups,grafana_get_current_oncall_users,grafana_search_dashboards"
 ```
+
+**Datasource resolution.** A small model reliably fumbles Grafana's opaque
+datasource UIDs — it passes the type (`"prometheus"`) or mistypes the UID, and
+burns tool rounds rediscovering them. When any `grafana_*` tool is allow-listed,
+Homa fetches the datasource list once at startup and (a) rewrites a friendly
+`datasourceUid` (name/type/`default`) to the real UID before each call, and
+(b) pins the datasource names plus a short "list the metric first, don't guess
+UIDs or metric names" playbook into the system prompt. So the model passes
+`"prometheus"` and Homa resolves it — no not-found rounds, no UID typos.
 
 How it works:
 

@@ -131,6 +131,12 @@ func main() {
 			if len(ex.Tools()) == 0 {
 				log.Printf("note: MCP_ALLOW matched no tools — set it, e.g. MCP_ALLOW=\"ddg_*\"")
 			}
+			// Pin the Grafana datasources (and a metric-name playbook) into the
+			// system prompt so the model uses friendly names instead of guessing UIDs.
+			if hint := ex.DatasourceHint(); hint != "" {
+				ag.cfg.systemPrompt += "\n\n" + hint
+				log.Printf("grafana: enriched system prompt with datasource hints")
+			}
 		}
 	}
 	ag.reset()
