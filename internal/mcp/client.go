@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -29,6 +30,9 @@ type Executor struct {
 	client *mcpclient.Client
 	tools  []lemonade.Tool // allow-listed
 	ds     *dsCache        // Grafana datasource name/type -> UID resolver (nil if no grafana tools)
+
+	lastDial  time.Time // last (re)connect attempt; gates the reconnect rate
+	dialFails int       // consecutive reconnect failures; grows the backoff
 }
 
 // New connects to the MCP endpoint, lists tools, and keeps only those matching
@@ -66,12 +70,14 @@ func (e *Executor) connect(ctx context.Context) error {
 		return fmt.Errorf("create MCP client: %w", err)
 	}
 	if err := c.Start(ctx); err != nil {
+		_ = c.Close()
 		return fmt.Errorf("start MCP client: %w", err)
 	}
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "voice-agent", Version: "0.1.0"}
 	if _, err := c.Initialize(ctx, initReq); err != nil {
+		_ = c.Close()
 		return fmt.Errorf("initialize MCP session: %w", err)
 	}
 	e.client = c
@@ -100,6 +106,14 @@ func (e *Executor) CallTool(ctx context.Context, name, argsJSON string) (string,
 	req.Params.Arguments = args
 
 	res, err := e.client.CallTool(ctx, req)
+	if err != nil && ctx.Err() == nil {
+		// Transport failure (not a tool-level IsError, not the caller's timeout):
+		// the gateway or a backend MCP may have restarted. Try a rate-limited
+		// reconnect and a single retry on the fresh session.
+		if e.reconnect(ctx) {
+			res, err = e.client.CallTool(ctx, req)
+		}
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("call %q: %w", name, err)
 	}
@@ -115,6 +129,44 @@ func (e *Executor) Close() error {
 		return e.client.Close()
 	}
 	return nil
+}
+
+// reconnect re-establishes a dead MCP session — the recovery path when a tool
+// call fails on the transport (the gateway or a backend MCP restarted). It dials
+// at most once per backoff window (1s doubling to a 30s cap, reset on success),
+// so a permanently-down MCP is retried periodically, never in a tight loop. The
+// caller must hold e.mu. Returns true when the client is usable afterwards.
+func (e *Executor) reconnect(ctx context.Context) bool {
+	if !e.lastDial.IsZero() && time.Since(e.lastDial) < e.backoff() {
+		return false // still cooling down — fail fast instead of hammering
+	}
+	e.lastDial = time.Now()
+
+	old := e.client
+	if err := e.connect(ctx); err != nil { // connect swaps e.client only on success
+		e.dialFails++
+		log.Printf("mcp: reconnect to %s failed (attempt %d, next try in ~%s): %v", e.url, e.dialFails, e.backoff(), err)
+		return false
+	}
+	e.dialFails = 0
+	if old != nil {
+		_ = old.Close() // drop the dead session now that a fresh one is up
+	}
+	log.Printf("mcp: reconnected to %s", e.url)
+	return true
+}
+
+// backoff is the minimum gap between reconnect attempts: 1s doubling to a 30s cap.
+func (e *Executor) backoff() time.Duration {
+	const base, maxGap = time.Second, 30 * time.Second
+	d := base
+	for i := 0; i < e.dialFails && d < maxGap; i++ {
+		d *= 2
+	}
+	if d > maxGap {
+		d = maxGap
+	}
+	return d
 }
 
 func convertTool(t mcp.Tool) lemonade.Tool {

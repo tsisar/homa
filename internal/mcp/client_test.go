@@ -3,7 +3,31 @@ package mcp
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestExecutorBackoff(t *testing.T) {
+	e := &Executor{}
+	tests := []struct {
+		fails int
+		want  time.Duration
+	}{
+		{0, 1 * time.Second},
+		{1, 2 * time.Second},
+		{2, 4 * time.Second},
+		{3, 8 * time.Second},
+		{4, 16 * time.Second},
+		{5, 30 * time.Second}, // 32s capped to 30s
+		{6, 30 * time.Second},
+		{100, 30 * time.Second}, // no overflow at large failure counts
+	}
+	for _, tt := range tests {
+		e.dialFails = tt.fails
+		if got := e.backoff(); got != tt.want {
+			t.Errorf("backoff(dialFails=%d) = %s, want %s", tt.fails, got, tt.want)
+		}
+	}
+}
 
 // the exact grafana_list_datasources response shape from the live gateway
 const realDatasources = `{"datasources":[` +
