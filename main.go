@@ -45,7 +45,8 @@ type config struct {
 	ttsModel        string
 	ttsVoice        string
 	ttsFormat       string
-	thinking        bool // reasoning enabled; default off — Qwen3 returns empty content with it on
+	ttsSpeed        float64 // speech rate; 0 = backend default
+	thinking        bool    // reasoning enabled; default off — Qwen3 returns empty content with it on
 	mcpURL          string
 	mcpAllow        []string
 	searchFiller    string
@@ -72,6 +73,7 @@ func loadConfig() config {
 		ttsModel:     envOr("TTS_MODEL", "kokoro-v1"),
 		ttsVoice:     envOr("TTS_VOICE", "af_heart"),
 		ttsFormat:    envOr("TTS_FORMAT", "wav"),
+		ttsSpeed:     envFloat("TTS_SPEED", 0), // 0 = backend default; StyleTTS2 honors ~0.8–1.3 (max 1.3)
 		thinking:     envOr("THINKING", "false") == "true",
 		mcpURL:       envOr("MCP_URL", ""), // empty = MCP disabled
 		mcpAllow:     splitCSV(envOr("MCP_ALLOW", "")),
@@ -116,7 +118,7 @@ func main() {
 	ag := &agent{
 		cfg: cfg,
 		lem: lemonade.New(cfg.apiURL), // chat + STT, both via the single endpoint
-		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat),
+		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat, cfg.ttsSpeed),
 	}
 	ag.lem.MaxTokens = cfg.maxTokens
 	if cfg.thinking {
@@ -802,6 +804,16 @@ func envInt(key string, def int) int {
 			return n
 		}
 		log.Printf("invalid %s=%q, using %d", key, v, def)
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			return f
+		}
+		log.Printf("invalid %s=%q, using %g", key, v, def)
 	}
 	return def
 }

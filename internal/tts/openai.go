@@ -21,28 +21,31 @@ import (
 // OpenAISpeech calls POST {BaseURL}/audio/speech and returns the audio bytes
 // plus the response content-type (so callers can write/play them as-is).
 type OpenAISpeech struct {
-	BaseURL string // e.g. http://192.168.88.83:8000/api/v1
-	Model   string // e.g. kokoro-v1
-	Voice   string // e.g. af_heart
-	Format  string // response_format: wav | mp3 | pcm | opus | flac
+	BaseURL string  // e.g. http://192.168.88.83:8000/api/v1
+	Model   string  // e.g. kokoro-v1
+	Voice   string  // e.g. af_heart
+	Format  string  // response_format: wav | mp3 | pcm | opus | flac
+	Speed   float64 // speech rate; 0 = omit (backend default). StyleTTS2 honors ~0.8–1.3
 	HTTP    *http.Client
 }
 
-func NewOpenAISpeech(baseURL, model, voice, format string) *OpenAISpeech {
+func NewOpenAISpeech(baseURL, model, voice, format string, speed float64) *OpenAISpeech {
 	return &OpenAISpeech{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Model:   model,
 		Voice:   voice,
 		Format:  format,
+		Speed:   speed,
 		HTTP:    &http.Client{},
 	}
 }
 
 type speechRequest struct {
-	Model          string `json:"model"`
-	Input          string `json:"input"`
-	Voice          string `json:"voice"`
-	ResponseFormat string `json:"response_format"`
+	Model          string  `json:"model"`
+	Input          string  `json:"input"`
+	Voice          string  `json:"voice"`
+	ResponseFormat string  `json:"response_format"`
+	Speed          float64 `json:"speed,omitempty"` // omitted when 0 → backend default
 }
 
 // Speak synthesizes text in the configured default format.
@@ -75,6 +78,7 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 		Input:          text,
 		Voice:          s.Voice,
 		ResponseFormat: backendFormat,
+		Speed:          s.Speed,
 	})
 	if err != nil {
 		return nil, "", err
@@ -87,7 +91,7 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 	req.Header.Set("Content-Type", "application/json")
 
 	// Trace: TTS request metadata only — skip the synthesized audio (response is a blob).
-	log.Tracef("[tts] request: model=%s voice=%s format=%s input=%dB", s.Model, s.Voice, backendFormat, len(text))
+	log.Tracef("[tts] request: model=%s voice=%s format=%s speed=%.2f input=%dB", s.Model, s.Voice, backendFormat, s.Speed, len(text))
 
 	resp, err := s.HTTP.Do(req)
 	if err != nil {
