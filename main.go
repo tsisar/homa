@@ -555,18 +555,28 @@ func clampText(s string, limit int) string {
 	return s[:limit-len(marker)] + marker
 }
 
-// clampSpeech trims a spoken reply to at most max bytes, cutting at the last
-// sentence end (. ! ?) within the window so TTS never reads a half-sentence —
-// and never a 60-second monologue that outlasts the ESP's recv timeout. Falls
-// back to the last word boundary. max <= 0 disables it.
+// clampSpeech trims a spoken reply so TTS always ends on a COMPLETE sentence —
+// never a half-word from a length-truncated model (finish_reason "length"),
+// never a mid-clause chop. It keeps whole sentences up to ~max bytes; if even
+// the first sentence is longer than max it is kept whole (a finished thought
+// beats a clean cut), and a trailing fragment with no terminator is dropped.
+// Only when there is no sentence terminator at all does it fall back to a word
+// boundary. max <= 0 disables it.
 func clampSpeech(s string, max int) string {
+	s = strings.TrimSpace(s)
 	if max <= 0 || len(s) <= max {
 		return s
 	}
-	cut := s[:max]
-	if i := strings.LastIndexAny(cut, ".!?"); i >= 0 {
-		return strings.TrimSpace(cut[:i+1])
+	if i := strings.LastIndexAny(s[:max], ".!?"); i >= 0 {
+		return strings.TrimSpace(s[:i+1])
 	}
+	// The first sentence already exceeds max: keep it whole rather than chop it
+	// mid-thought (and so drop any length-truncated fragment after it).
+	if i := strings.IndexAny(s, ".!?"); i >= 0 {
+		return strings.TrimSpace(s[:i+1])
+	}
+	// No sentence terminator anywhere: last-resort word boundary at the cap.
+	cut := s[:max]
 	if i := strings.LastIndexByte(cut, ' '); i >= 0 {
 		return strings.TrimSpace(cut[:i])
 	}

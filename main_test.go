@@ -46,15 +46,18 @@ func TestClampSpeech(t *testing.T) {
 		{"cut at sentence", "First sentence. Second sentence. Third one here.", 20, "First sentence."},
 		{"cut at word", "no sentence enders here at all in this one", 20, "no sentence enders"},
 		{"cyrillic sentence", "Перше речення тут. Друге речення. Третє.", 36, "Перше речення тут."},
+		// first sentence longer than the cap is kept whole, not chopped mid-clause
+		{"first sentence over cap kept whole", "This whole first sentence is quite long. Short.", 20, "This whole first sentence is quite long."},
+		// a length-truncated trailing fragment (no terminator) is dropped
+		{"truncated tail dropped", "Complete sentence here that is fairly long indeed. trailing frag no end", 30, "Complete sentence here that is fairly long indeed."},
 	}
 	for _, tt := range tests {
 		got := clampSpeech(tt.in, tt.max)
 		if got != tt.want {
 			t.Errorf("%s: clampSpeech(%q, %d) = %q, want %q", tt.name, tt.in, tt.max, got, tt.want)
 		}
-		if tt.max > 0 && len(got) > tt.max {
-			t.Errorf("%s: result %d bytes exceeds max %d", tt.name, len(got), tt.max)
-		}
+		// Note: max is a soft target — a first sentence longer than max is kept
+		// whole on purpose, so result length may exceed max. `want` pins exactness.
 		if !utf8.ValidString(got) {
 			t.Errorf("%s: result is not valid UTF-8: %q", tt.name, got)
 		}
