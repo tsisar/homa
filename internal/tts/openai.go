@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/tsisar/extended-log-go/log"
 )
@@ -21,24 +22,33 @@ import (
 // OpenAISpeech calls POST {BaseURL}/audio/speech and returns the audio bytes
 // plus the response content-type (so callers can write/play them as-is).
 type OpenAISpeech struct {
-	BaseURL string  // e.g. http://192.168.88.83:8000/api/v1
-	Model   string  // e.g. kokoro-v1
-	Voice   string  // e.g. af_heart
-	Format  string  // response_format: wav | mp3 | pcm | opus | flac
-	Speed   float64 // speech rate; 0 = omit (backend default). StyleTTS2 honors ~0.8–1.3
+	BaseURL string // e.g. http://192.168.88.83:8000/api/v1
+	Model   string // e.g. kokoro-v1
+	Format  string // response_format default: wav | mp3 | pcm | opus | flac
 	HTTP    *http.Client
+
+	mu    sync.RWMutex // guards voice + speed (tunable at runtime via /api/config)
+	voice string       // e.g. af_heart
+	speed float64      // speech rate; 0 = omit (backend default). StyleTTS2 honors ~0.8–1.3
 }
 
 func NewOpenAISpeech(baseURL, model, voice, format string, speed float64) *OpenAISpeech {
 	return &OpenAISpeech{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Model:   model,
-		Voice:   voice,
 		Format:  format,
-		Speed:   speed,
 		HTTP:    &http.Client{},
+		voice:   voice,
+		speed:   speed,
 	}
 }
+
+// Voice/SetVoice and Speed/SetSpeed expose the runtime-tunable knobs; reads and
+// writes are safe to race (the /api/config handler may set them mid-turn).
+func (s *OpenAISpeech) Voice() string      { s.mu.RLock(); defer s.mu.RUnlock(); return s.voice }
+func (s *OpenAISpeech) SetVoice(v string)  { s.mu.Lock(); s.voice = v; s.mu.Unlock() }
+func (s *OpenAISpeech) Speed() float64     { s.mu.RLock(); defer s.mu.RUnlock(); return s.speed }
+func (s *OpenAISpeech) SetSpeed(v float64) { s.mu.Lock(); s.speed = v; s.mu.Unlock() }
 
 type speechRequest struct {
 	Model          string  `json:"model"`
@@ -73,12 +83,13 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 		backendFormat = "wav"
 	}
 
+	voice, speed := s.Voice(), s.Speed() // snapshot the runtime-tunable knobs
 	body, err := json.Marshal(speechRequest{
 		Model:          s.Model,
 		Input:          text,
-		Voice:          s.Voice,
+		Voice:          voice,
 		ResponseFormat: backendFormat,
-		Speed:          s.Speed,
+		Speed:          speed,
 	})
 	if err != nil {
 		return nil, "", err
@@ -91,7 +102,7 @@ func (s *OpenAISpeech) SpeakAs(ctx context.Context, text, format string) ([]byte
 	req.Header.Set("Content-Type", "application/json")
 
 	// Trace: TTS request metadata only — skip the synthesized audio (response is a blob).
-	log.Tracef("[tts] request: model=%s voice=%s format=%s speed=%.2f input=%dB", s.Model, s.Voice, backendFormat, s.Speed, len(text))
+	log.Tracef("[tts] request: model=%s voice=%s format=%s speed=%.2f input=%dB", s.Model, voice, backendFormat, speed, len(text))
 
 	resp, err := s.HTTP.Do(req)
 	if err != nil {

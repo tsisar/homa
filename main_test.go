@@ -6,7 +6,44 @@ import (
 	"unicode/utf8"
 
 	"agent/internal/lemonade"
+	"agent/internal/tts"
 )
+
+func TestCleanReasoning(t *testing.T) {
+	tests := map[string]string{
+		"low": "low", "MEDIUM": "medium", " high ": "high",
+		"": "", "bogus": "", "lowish": "",
+	}
+	for in, want := range tests {
+		if got := cleanReasoning(in); got != want {
+			t.Errorf("cleanReasoning(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestConfigStateRoundTrip(t *testing.T) {
+	ag := &agent{
+		lem: lemonade.New("http://x"),
+		tts: tts.NewOpenAISpeech("http://x", "m", "v1", "wav", 1.0),
+	}
+	ag.replyMaxChars.Store(350)
+
+	st := ag.configState()
+	if st["tts_voice"] != "v1" || st["tts_speed"] != 1.0 || st["reply_max_chars"] != 350 || st["reasoning_effort"] != "" {
+		t.Fatalf("initial state wrong: %v", st)
+	}
+
+	// Apply the same accessors the POST /api/config handler uses.
+	ag.lem.SetReasoningEffort("low")
+	ag.tts.SetSpeed(1.2)
+	ag.tts.SetVoice("v2")
+	ag.replyMaxChars.Store(200)
+
+	st = ag.configState()
+	if st["reasoning_effort"] != "low" || st["tts_speed"] != 1.2 || st["tts_voice"] != "v2" || st["reply_max_chars"] != 200 {
+		t.Errorf("updated state wrong: %v", st)
+	}
+}
 
 func TestClampText(t *testing.T) {
 	tests := []struct {

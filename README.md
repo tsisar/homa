@@ -62,10 +62,30 @@ go run .
 | `POST /api/say`   | `{"text":"..."}`           | audio (TTS only)                                       |
 | `POST /api/stt`   | multipart `file` = PCM WAV | `{"text":"..."}` (Whisper)                             |
 | `POST /api/reset` | —                          | clears conversation history                            |
+| `GET  /api/config`| —                          | current runtime-tunable settings (JSON)                |
+| `POST /api/config`| `{"reasoning_effort":...}` | update a subset of settings; returns the new state     |
 
 ```sh
 curl -X POST localhost:8080/api/talk -d '{"text":"Tell me a joke"}' -o reply.wav -D - | grep -i x-reply
 afplay reply.wav
+```
+
+### Runtime config (`/api/config`)
+
+A few knobs are tunable live (no restart) — meant for a settings UI such as the
+ESP32 client. Each field's startup default comes from the matching env var below;
+a `POST` overrides it until the next restart.
+
+| Field              | Meaning                                                              |
+|--------------------|---------------------------------------------------------------------|
+| `reasoning_effort` | gpt-oss reasoning depth: `low` \| `medium` \| `high` \| `""` (off)   |
+| `tts_speed`        | speech rate (StyleTTS2 honors ~0.8–1.3; `0` = backend default)       |
+| `tts_voice`        | TTS voice name                                                       |
+| `reply_max_chars`  | spoken-reply cap; `0` = unlimited                                    |
+
+```sh
+curl localhost:8080/api/config
+curl -X POST localhost:8080/api/config -d '{"reasoning_effort":"low","tts_speed":1.2}'
 ```
 
 ## Configuration (env vars)
@@ -74,17 +94,22 @@ afplay reply.wav
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `API_URL`           | `http://llm.tsisar.local/local/v1` — single endpoint for chat + STT + TTS (LLM gateway, local provider). Set to `http://192.168.88.83:8000/api/v1` to hit Lemonade directly |
 | `CHAT_MODEL`        | `Qwen3.6-35B-A3B-MTP-GGUF`                                                                                                                                                  |
+| `REASONING_EFFORT`  | empty — gpt-oss/harmony reasoning depth (`low`/`medium`/`high`), sent as `chat_template_kwargs.reasoning_effort`. Runtime-tunable via `/api/config`                          |
 | `STT_MODEL`         | `Whisper-Large-v3-Turbo`                                                                                                                                                    |
+| `STT_LANG`          | empty (auto-detect the spoken language); e.g. `uk` to force Ukrainian                                                                                                       |
 | `TTS_URL`           | = `API_URL` (optional override, e.g. Chatterbox on a Mac)                                                                                                                   |
 | `TTS_MODEL`         | `kokoro-v1`                                                                                                                                                                 |
-| `TTS_VOICE`         | `af_heart` (warm female; `am_michael`, `bf_emma`)                                                                                                                           |
+| `TTS_VOICE`         | `af_heart` (warm female; `am_michael`, `bf_emma`). Runtime-tunable via `/api/config`                                                                                        |
 | `TTS_FORMAT`        | `wav`                                                                                                                                                                       |
+| `TTS_SPEED`         | `0` (backend default) — speech rate; StyleTTS2 honors ~0.8–1.3 (max 1.3). Runtime-tunable via `/api/config`                                                                 |
 | `THINKING`         | `false` — reasoning off by default; a Qwen3 model replies empty with it on. Set `true` only for a non-reasoning chat model                                                  |
 | `MCP_URL`           | empty (MCP disabled); e.g. `http://mcp.tsisar.local/`                                                                                                                       |
 | `MCP_ALLOW`         | empty (no tools); CSV of names/globs, e.g. `web_*` or `*`                                                                                                                   |
+| `MCP_RECONNECT`     | `ask` — a mid-session MCP drop is reconnected only after the user agrees (model calls `reconnect_tools`). `auto` = silent backoff reconnect; `off` = never                  |
 | `SEARCH_FILLER`     | `Let me look that up.` — spoken once when tools start; empty disables                                                                                                       |
 | `CONTEXT_TOKENS`    | `4096` — model context window; **must match the backend** (`llama-server -c`). History is summarized before it fills                                                        |
-| `MAX_TOKENS`        | `512` — reply budget reserved below `CONTEXT_TOKENS`                                                                                                                        |
+| `MAX_TOKENS`        | `512` — reply budget reserved below `CONTEXT_TOKENS`. Raise for reasoning models (gpt-oss) that would otherwise truncate at `finish_reason:length`                          |
+| `REPLY_MAX_CHARS`   | `350` — spoken-reply cap; trimmed to a whole sentence. `0` = unlimited. Runtime-tunable via `/api/config`                                                                    |
 | `TOOL_OUTPUT_LIMIT` | `8000` — max chars a single tool result may add to live history                                                                                                             |
 | `MAX_TOOL_ROUNDS`   | `8` — tool-calling rounds before the model is nudged to answer in words                                                                                                     |
 | `ADDR`              | `:8080`                                                                                                                                                                     |

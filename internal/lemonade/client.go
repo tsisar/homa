@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/tsisar/extended-log-go/log"
 )
@@ -37,6 +38,40 @@ type Client struct {
 
 	// MaxTokens caps the reply length (max_tokens). Zero falls back to 512.
 	MaxTokens int
+
+	// mu guards reasoningEffort, which is tunable at runtime (POST /api/config).
+	mu              sync.RWMutex
+	reasoningEffort string // "" | low | medium | high; merged into chat_template_kwargs
+}
+
+// SetReasoningEffort sets the gpt-oss/harmony reasoning effort sent on each chat
+// request. "" omits it (backend default). Safe to call concurrently with Chat.
+func (c *Client) SetReasoningEffort(effort string) {
+	c.mu.Lock()
+	c.reasoningEffort = effort
+	c.mu.Unlock()
+}
+
+// ReasoningEffort returns the current reasoning effort ("" when unset).
+func (c *Client) ReasoningEffort() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reasoningEffort
+}
+
+// chatKwargs merges the static ChatTemplateKwargs with the runtime reasoning
+// effort into a fresh map (never mutating the shared base) for one request.
+func (c *Client) chatKwargs() map[string]any {
+	effort := c.ReasoningEffort()
+	if effort == "" {
+		return c.ChatTemplateKwargs
+	}
+	m := make(map[string]any, len(c.ChatTemplateKwargs)+1)
+	for k, v := range c.ChatTemplateKwargs {
+		m[k] = v
+	}
+	m["reasoning_effort"] = effort
+	return m
 }
 
 func New(baseURL string) *Client {
@@ -185,7 +220,7 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, tools [
 		Temperature:        0.7,
 		MaxTokens:          maxTokens,
 		Stream:             false,
-		ChatTemplateKwargs: c.ChatTemplateKwargs,
+		ChatTemplateKwargs: c.chatKwargs(),
 	}
 	for _, t := range tools {
 		req.Tools = append(req.Tools, wireTool{

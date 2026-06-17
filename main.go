@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agent/internal/lemonade"
@@ -39,6 +40,7 @@ import (
 type config struct {
 	apiURL          string // single OpenAI-compatible endpoint for chat + STT + TTS (the LLM gateway, local provider)
 	chatModel       string
+	reasoningEffort string // gpt-oss/harmony reasoning effort: "" | low | medium | high
 	sttModel        string
 	sttLang         string // Whisper language hint; "" = auto-detect the spoken language
 	ttsURL          string
@@ -66,19 +68,22 @@ func loadConfig() config {
 	// Lemonade (http://192.168.88.83:8000/api/v1) for local/offline runs.
 	api := envOr("API_URL", "http://llm.tsisar.local/local/v1")
 	return config{
-		apiURL:       api,
-		chatModel:    envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
-		sttModel:     envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
-		sttLang:      envOr("STT_LANG", ""), // empty = auto-detect (don't force English)
-		ttsURL:       envOr("TTS_URL", api), // optional override (e.g. Chatterbox); defaults to API_URL
-		ttsModel:     envOr("TTS_MODEL", "kokoro-v1"),
-		ttsVoice:     envOr("TTS_VOICE", "af_heart"),
-		ttsFormat:    envOr("TTS_FORMAT", "wav"),
-		ttsSpeed:     envFloat("TTS_SPEED", 0), // 0 = backend default; StyleTTS2 honors ~0.8–1.3 (max 1.3)
-		thinking:     envOr("THINKING", "false") == "true",
-		mcpURL:       envOr("MCP_URL", ""), // empty = MCP disabled
-		mcpAllow:     splitCSV(envOr("MCP_ALLOW", "")),
-		mcpReconnect: envOr("MCP_RECONNECT", mcp.ReconnectAuto),      // auto | ask | off
+		apiURL:          api,
+		chatModel:       envOr("CHAT_MODEL", "Qwen3.6-35B-A3B-MTP-GGUF"),
+		reasoningEffort: cleanReasoning(envOr("REASONING_EFFORT", "")), // "" | low | medium | high
+		sttModel:        envOr("STT_MODEL", "Whisper-Large-v3-Turbo"),
+		sttLang:         envOr("STT_LANG", ""), // empty = auto-detect (don't force English)
+		ttsURL:          envOr("TTS_URL", api), // optional override (e.g. Chatterbox); defaults to API_URL
+		ttsModel:        envOr("TTS_MODEL", "kokoro-v1"),
+		ttsVoice:        envOr("TTS_VOICE", "af_heart"),
+		ttsFormat:       envOr("TTS_FORMAT", "wav"),
+		ttsSpeed:        envFloat("TTS_SPEED", 0), // 0 = backend default; StyleTTS2 honors ~0.8–1.3 (max 1.3)
+		thinking:        envOr("THINKING", "false") == "true",
+		mcpURL:          envOr("MCP_URL", ""), // empty = MCP disabled
+		mcpAllow:        splitCSV(envOr("MCP_ALLOW", "")),
+		// Auto-connect at startup; if the MCP drops mid-session, ask the user before
+		// reconnecting (the model gets reconnect_tools). off | auto override.
+		mcpReconnect: envOr("MCP_RECONNECT", mcp.ReconnectAsk),
 		searchFiller: envOr("SEARCH_FILLER", "Let me look that up."), // spoken before tools run; empty = off
 		addr:         envOr("ADDR", ":8080"),
 		systemPrompt: envOr("SYSTEM_PROMPT", defaultSystemPrompt),
@@ -123,6 +128,8 @@ func main() {
 		tts: tts.NewOpenAISpeech(cfg.ttsURL, cfg.ttsModel, cfg.ttsVoice, cfg.ttsFormat, cfg.ttsSpeed),
 	}
 	ag.lem.MaxTokens = cfg.maxTokens
+	ag.lem.SetReasoningEffort(cfg.reasoningEffort)
+	ag.replyMaxChars.Store(int64(cfg.replyMaxChars))
 	if cfg.thinking {
 		log.Printf("warning: THINKING is on — a Qwen3-family model will reason into reasoning_content and reply with empty content (no speech). Leave THINKING off (the default) unless the chat model is non-reasoning.")
 	} else {
@@ -190,6 +197,10 @@ type agent struct {
 	tts   *tts.OpenAISpeech
 	tools toolExecutor // nil when MCP is disabled
 
+	// replyMaxChars caps the spoken reply (REPLY_MAX_CHARS), tunable at runtime via
+	// POST /api/config; clampSpeech treats <= 0 as unlimited.
+	replyMaxChars atomic.Int64
+
 	// turnMu serializes whole turns. compact() releases a.mu across a slow
 	// summarize() call, so without this two concurrent turns (or a reset racing
 	// a turn) could interleave and drop live history. a.mu still guards the
@@ -217,6 +228,17 @@ func (a *agent) reset() int {
 	a.history = nil
 	a.lastPrompt = 0
 	return n
+}
+
+// configState is the JSON view of the runtime-tunable settings (GET/POST
+// /api/config). Each field is read through its owner's thread-safe accessor.
+func (a *agent) configState() map[string]any {
+	return map[string]any{
+		"reasoning_effort": a.lem.ReasoningEffort(),
+		"tts_speed":        a.tts.Speed(),
+		"tts_voice":        a.tts.Voice(),
+		"reply_max_chars":  int(a.replyMaxChars.Load()),
+	}
 }
 
 const (
@@ -348,7 +370,7 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 	// A minute-long monologue blows past the ESP's recv timeout and is unusable
 	// as speech. The system prompt asks for brevity; this enforces it even when
 	// the model enumerates search results anyway.
-	reply = clampSpeech(reply, a.cfg.replyMaxChars)
+	reply = clampSpeech(reply, int(a.replyMaxChars.Load()))
 
 	a.mu.Lock()
 	a.history = append(a.history, lemonade.Message{Role: "assistant", Content: reply})
@@ -712,6 +734,53 @@ func (a *agent) serve() {
 		fmt.Fprintln(w, "ok")
 	})
 
+	// GET  /api/config -> current runtime-tunable settings (for a settings UI).
+	// POST /api/config {"reasoning_effort":"low","tts_speed":1.2, ...} -> update a
+	// subset at runtime (no restart); returns the new full state.
+	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, a.configState())
+	})
+	mux.HandleFunc("POST /api/config", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ReasoningEffort *string  `json:"reasoning_effort"`
+			TTSSpeed        *float64 `json:"tts_speed"`
+			TTSVoice        *string  `json:"tts_voice"`
+			ReplyMaxChars   *int     `json:"reply_max_chars"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "expected a JSON object", http.StatusBadRequest)
+			return
+		}
+		if body.ReasoningEffort != nil {
+			eff := strings.ToLower(strings.TrimSpace(*body.ReasoningEffort))
+			if !validReasoningEffort(eff) {
+				http.Error(w, "reasoning_effort must be low, medium, high, or empty", http.StatusBadRequest)
+				return
+			}
+			a.lem.SetReasoningEffort(eff)
+		}
+		if body.TTSSpeed != nil {
+			if *body.TTSSpeed < 0 {
+				http.Error(w, "tts_speed must be >= 0", http.StatusBadRequest)
+				return
+			}
+			a.tts.SetSpeed(*body.TTSSpeed)
+		}
+		if body.TTSVoice != nil {
+			if v := strings.TrimSpace(*body.TTSVoice); v != "" {
+				a.tts.SetVoice(v)
+			} else {
+				http.Error(w, "tts_voice must not be empty", http.StatusBadRequest)
+				return
+			}
+		}
+		if body.ReplyMaxChars != nil {
+			a.replyMaxChars.Store(int64(*body.ReplyMaxChars))
+		}
+		log.Printf("config updated via /api/config: %v", a.configState())
+		writeJSON(w, a.configState())
+	})
+
 	log.Printf("Homa %s listening on %s (LLM=%s, TTS=%s voice=%s)", version, a.cfg.addr, a.cfg.chatModel, a.cfg.ttsModel, a.cfg.ttsVoice)
 	if err := http.ListenAndServe(a.cfg.addr, mux); err != nil {
 		log.Fatalf("%v", err)
@@ -832,6 +901,31 @@ func envFloat(key string, def float64) float64 {
 		log.Printf("invalid %s=%q, using %g", key, v, def)
 	}
 	return def
+}
+
+// validReasoningEffort reports whether s is an accepted gpt-oss/harmony reasoning
+// level; "" means omit the field (backend default).
+func validReasoningEffort(s string) bool {
+	switch s {
+	case "", "low", "medium", "high":
+		return true
+	}
+	return false
+}
+
+// cleanReasoning normalizes a REASONING_EFFORT value, dropping an invalid one.
+func cleanReasoning(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if validReasoningEffort(s) {
+		return s
+	}
+	log.Printf("invalid REASONING_EFFORT=%q (use low|medium|high), ignoring", s)
+	return ""
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func splitCSV(s string) []string {

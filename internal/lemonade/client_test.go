@@ -6,6 +6,31 @@ import (
 	"testing"
 )
 
+func TestChatKwargs(t *testing.T) {
+	c := New("http://x")
+	c.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+
+	// Unset effort: the base map is returned as-is, no reasoning_effort.
+	if got := c.chatKwargs(); got["reasoning_effort"] != nil {
+		t.Errorf("unset effort must not add reasoning_effort: %v", got)
+	}
+
+	c.SetReasoningEffort("low")
+	got := c.chatKwargs()
+	if got["reasoning_effort"] != "low" {
+		t.Errorf("reasoning_effort not merged: %v", got)
+	}
+	if got["enable_thinking"] != false {
+		t.Errorf("base kwarg lost: %v", got)
+	}
+	if _, ok := c.ChatTemplateKwargs["reasoning_effort"]; ok {
+		t.Error("base ChatTemplateKwargs must not be mutated")
+	}
+	if got := c.ReasoningEffort(); got != "low" {
+		t.Errorf("ReasoningEffort() = %q, want low", got)
+	}
+}
+
 func TestToWireMultimodal(t *testing.T) {
 	msgs := []Message{
 		{Role: "tool", ToolCallID: "c1", Content: "panel:", Images: []Image{{MIME: "image/png", Data: "QUJD"}}},
