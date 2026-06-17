@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"agent/internal/lemonade"
 )
@@ -29,6 +30,33 @@ func TestClampText(t *testing.T) {
 		// could re-clip the same value forever without shrinking it.
 		if again := clampText(got, tt.limit); again != got {
 			t.Errorf("%s: clampText not idempotent: %q -> %q", tt.name, got, again)
+		}
+	}
+}
+
+func TestClampSpeech(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{"disabled", "one. two. three.", 0, "one. two. three."},
+		{"under limit", "Short reply.", 100, "Short reply."},
+		{"cut at sentence", "First sentence. Second sentence. Third one here.", 20, "First sentence."},
+		{"cut at word", "no sentence enders here at all in this one", 20, "no sentence enders"},
+		{"cyrillic sentence", "Перше речення тут. Друге речення. Третє.", 36, "Перше речення тут."},
+	}
+	for _, tt := range tests {
+		got := clampSpeech(tt.in, tt.max)
+		if got != tt.want {
+			t.Errorf("%s: clampSpeech(%q, %d) = %q, want %q", tt.name, tt.in, tt.max, got, tt.want)
+		}
+		if tt.max > 0 && len(got) > tt.max {
+			t.Errorf("%s: result %d bytes exceeds max %d", tt.name, len(got), tt.max)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("%s: result is not valid UTF-8: %q", tt.name, got)
 		}
 	}
 }

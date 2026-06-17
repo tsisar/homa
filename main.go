@@ -55,6 +55,7 @@ type config struct {
 	maxTokens       int // reply budget reserved below the context window
 	toolOutputLimit int // chars a single tool result may add to live history
 	maxToolRounds   int // tool-calling rounds before forcing a final answer
+	replyMaxChars   int // hard cap on the spoken reply; 0 = unlimited
 }
 
 func loadConfig() config {
@@ -83,12 +84,14 @@ func loadConfig() config {
 		maxTokens:       envInt("MAX_TOKENS", 512),
 		toolOutputLimit: envInt("TOOL_OUTPUT_LIMIT", 8000),
 		maxToolRounds:   envInt("MAX_TOOL_ROUNDS", 8),
+		replyMaxChars:   envInt("REPLY_MAX_CHARS", 350),
 	}
 }
 
 const defaultSystemPrompt = "You are Homa, a friendly voice assistant for the home and homelab. " +
 	"Always reply in the same language the user speaks. " +
-	"Keep replies short and conversational, like real speech — usually one to three sentences. " +
+	"Keep replies short and conversational, like real speech — at most two or three sentences. " +
+	"Even after using tools or summarizing search results, give only the single most useful takeaway; never enumerate, never produce numbered or bulleted lists, and never speak more than a few sentences — the user can ask for more. " +
 	"When the user asks about recent events or facts you are unsure of, use the available tools. " +
 	"Do not use markdown, lists, emojis, or special characters, and never read out raw URLs, because your reply will be read aloud."
 
@@ -334,6 +337,10 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 		reply = "Sorry, I couldn't get that just now."
 	}
 	reply = sanitize(reply)
+	// A minute-long monologue blows past the ESP's recv timeout and is unusable
+	// as speech. The system prompt asks for brevity; this enforces it even when
+	// the model enumerates search results anyway.
+	reply = clampSpeech(reply, a.cfg.replyMaxChars)
 
 	a.mu.Lock()
 	a.history = append(a.history, lemonade.Message{Role: "assistant", Content: reply})
@@ -538,6 +545,24 @@ func clampText(s string, limit int) string {
 		return s[:limit]
 	}
 	return s[:limit-len(marker)] + marker
+}
+
+// clampSpeech trims a spoken reply to at most max bytes, cutting at the last
+// sentence end (. ! ?) within the window so TTS never reads a half-sentence —
+// and never a 60-second monologue that outlasts the ESP's recv timeout. Falls
+// back to the last word boundary. max <= 0 disables it.
+func clampSpeech(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	cut := s[:max]
+	if i := strings.LastIndexAny(cut, ".!?"); i >= 0 {
+		return strings.TrimSpace(cut[:i+1])
+	}
+	if i := strings.LastIndexByte(cut, ' '); i >= 0 {
+		return strings.TrimSpace(cut[:i])
+	}
+	return strings.TrimSpace(cut)
 }
 
 // renderTranscript flattens turns into plain text for the summarizer, clipping
