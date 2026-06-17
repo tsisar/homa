@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+func TestNormalizeMode(t *testing.T) {
+	tests := map[string]string{
+		"auto":  ReconnectAuto,
+		"ask":   ReconnectAsk,
+		"off":   ReconnectOff,
+		"ASK":   ReconnectAsk,  // case-insensitive
+		" off ": ReconnectOff,  // trimmed
+		"":      ReconnectAuto, // unset → auto (prior behavior)
+		"bogus": ReconnectAuto, // unknown → auto, never a broken mode
+	}
+	for in, want := range tests {
+		if got := normalizeMode(in); got != want {
+			t.Errorf("normalizeMode(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestExecutorBackoff(t *testing.T) {
 	e := &Executor{}
 	tests := []struct {

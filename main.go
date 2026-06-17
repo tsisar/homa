@@ -49,6 +49,7 @@ type config struct {
 	thinking        bool    // reasoning enabled; default off — Qwen3 returns empty content with it on
 	mcpURL          string
 	mcpAllow        []string
+	mcpReconnect    string // dropped-MCP policy: auto | ask | off
 	searchFiller    string
 	addr            string
 	systemPrompt    string
@@ -77,6 +78,7 @@ func loadConfig() config {
 		thinking:     envOr("THINKING", "false") == "true",
 		mcpURL:       envOr("MCP_URL", ""), // empty = MCP disabled
 		mcpAllow:     splitCSV(envOr("MCP_ALLOW", "")),
+		mcpReconnect: envOr("MCP_RECONNECT", mcp.ReconnectAuto),      // auto | ask | off
 		searchFiller: envOr("SEARCH_FILLER", "Let me look that up."), // spoken before tools run; empty = off
 		addr:         envOr("ADDR", ":8080"),
 		systemPrompt: envOr("SYSTEM_PROMPT", defaultSystemPrompt),
@@ -129,7 +131,7 @@ func main() {
 		ag.lem.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
 	}
 	if cfg.mcpURL != "" {
-		ex, err := mcp.New(context.Background(), cfg.mcpURL, cfg.mcpAllow)
+		ex, err := mcp.New(context.Background(), cfg.mcpURL, cfg.mcpAllow, cfg.mcpReconnect)
 		if err != nil {
 			log.Printf("MCP disabled (%s): %v", cfg.mcpURL, err)
 		} else {
@@ -143,6 +145,10 @@ func main() {
 			if hint := ex.DatasourceHint(); hint != "" {
 				ag.cfg.systemPrompt += "\n\n" + hint
 				log.Printf("grafana: enriched system prompt with datasource hints")
+			}
+			if hint := ex.ReconnectHint(); hint != "" {
+				ag.cfg.systemPrompt += "\n\n" + hint
+				log.Printf("mcp: ask mode — model will request permission before reconnect_tools")
 			}
 		}
 	}
