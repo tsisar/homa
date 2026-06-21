@@ -129,9 +129,34 @@ type ChatResult struct {
 }
 
 type apiError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Type    string `json:"type"`
+	Code    flexCode `json:"code"`
+	Message string   `json:"message"`
+	Type    string   `json:"type"`
+}
+
+// flexCode is an upstream error code that may arrive as a JSON string
+// ("context_length_exceeded") or a JSON number (llama-server sends "code":500 on
+// a 500). It always decodes to the string form, so callers compare and format it
+// uniformly — without this, a numeric code fails the whole response decode and
+// masks the real error behind a json unmarshal failure.
+type flexCode string
+
+func (c *flexCode) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		*c = ""
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*c = flexCode(s)
+		return nil
+	}
+	*c = flexCode(b) // number (or other scalar): keep its literal text
+	return nil
 }
 
 // ---- wire types (OpenAI chat-completions shape) --------------------------
