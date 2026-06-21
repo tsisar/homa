@@ -104,6 +104,14 @@ const defaultSystemPrompt = "You are Homa, a friendly voice assistant for the ho
 	"When the user asks about recent events or facts you are unsure of, use the available tools. " +
 	"Do not use markdown, lists, emojis, or special characters, and never read out raw URLs, because your reply will be read aloud."
 
+// imageSendHint teaches the image-handle convention so the model forwards a
+// tool-rendered picture (e.g. a Grafana panel) by reference instead of pasting
+// its base64 — which a small model truncates, corrupting the request. Appended to
+// the system prompt only when the MCP exposes a Telegram image-send tool.
+const imageSendHint = "When a tool returns an image, it is saved under a short handle like img1 (shown in the tool result). " +
+	"To send that image on Telegram, call the send_photo or send_document tool with the base64 field set to that handle, e.g. {\"base64\":\"img1\"}; " +
+	"the real image is substituted before sending. Never paste raw base64 image data into a tool call."
+
 // version is stamped at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
@@ -156,6 +164,10 @@ func main() {
 			if hint := ex.ReconnectHint(); hint != "" {
 				ag.cfg.systemPrompt += "\n\n" + hint
 				log.Printf("mcp: ask mode — model will request permission before reconnect_tools")
+			}
+			if hasImageSendTool(ex.Tools()) {
+				ag.cfg.systemPrompt += "\n\n" + imageSendHint
+				log.Printf("telegram: image-handle bridge enabled for send_photo/send_document/send_album")
 			}
 		}
 	}
@@ -214,6 +226,16 @@ type agent struct {
 	summary    string
 	history    []lemonade.Message
 	lastPrompt int // prompt_tokens of the most recent completion
+
+	// imgCache bridges tool-produced images to outgoing Telegram sends without
+	// routing the (large) base64 through the model. Each image a tool returns is
+	// registered under a short handle (img1, img2, …) the model can name in a
+	// telegram send call; resolveImageArgs swaps the handle back to the real bytes
+	// before the call leaves for MCP. Bounded to maxCachedImages and independent of
+	// history (so a panel stays sendable after stripImages). Guarded by a.mu.
+	imgCache map[string]lemonade.Image
+	imgOrder []string // handles, oldest first — bounds the cache
+	imgSeq   int      // monotonic handle counter (per conversation)
 }
 
 // reset clears the conversation and returns how many history messages were
@@ -227,6 +249,9 @@ func (a *agent) reset() int {
 	a.summary = ""
 	a.history = nil
 	a.lastPrompt = 0
+	a.imgCache = nil
+	a.imgOrder = nil
+	a.imgSeq = 0
 	return n
 }
 
@@ -247,6 +272,7 @@ const (
 	toolDigestLimit   = 500  // chars of a tool result kept in summaries / last-resort truncation
 	summaryCharLimit  = 1500 // hard cap on the rolling summary so it can't grow into the window
 	maxCompactRetries = 4    // compaction attempts on a context-overflow before giving up
+	maxCachedImages   = 16   // most recent tool-produced images kept addressable by handle
 )
 
 // finalAnswerNudge steers the model to answer in words on the round where tools
@@ -322,24 +348,37 @@ func (a *agent) respond(ctx context.Context, userText, ttsFormat string, onFille
 		}
 
 		if len(res.ToolCalls) > 0 && offer != nil && a.tools != nil {
+			// Drop tool calls with malformed (usually token-truncated) arguments
+			// before they reach history — persisting them poisons the prompt and
+			// makes the backend 500 on every later turn.
+			calls := validToolCalls(res.ToolCalls)
+			if len(calls) == 0 {
+				reply = res.Content
+				break
+			}
 			if !announced && onFiller != nil && a.cfg.searchFiller != "" {
 				onFiller(a.cfg.searchFiller)
 				announced = true
 			}
 			a.mu.Lock()
-			a.history = append(a.history, lemonade.Message{Role: "assistant", Content: res.Content, ToolCalls: res.ToolCalls})
+			a.history = append(a.history, lemonade.Message{Role: "assistant", Content: res.Content, ToolCalls: calls})
 			a.mu.Unlock()
-			for _, tc := range res.ToolCalls {
-				out, imgs, callErr := a.tools.CallTool(ctx, tc.Name, tc.Arguments)
+			for _, tc := range calls {
+				// Bridge image handles (img1, …) — and a missing image source — to the
+				// real cached bytes, so an image a prior tool produced can be sent
+				// without the model ever carrying its base64.
+				args := a.resolveImageArgs(tc.Name, tc.Arguments)
+				out, imgs, callErr := a.tools.CallTool(ctx, tc.Name, args)
 				if callErr != nil {
 					out = "error: " + callErr.Error()
 				}
+				// Register any returned image under a handle and tell the model how to
+				// send it (by handle, never by pasting base64).
+				if hint := a.rememberImages(imgs); hint != "" {
+					out = strings.TrimSpace(out + "\n" + hint)
+				}
 				if strings.TrimSpace(out) == "" {
-					if len(imgs) > 0 {
-						out = "(image returned)"
-					} else {
-						out = "(no output)"
-					}
+					out = "(no output)"
 				}
 				log.Printf("tool %s(%s) -> %d chars, %d image(s)", tc.Name, truncate(tc.Arguments, 100), len(out), len(imgs))
 				// Cap the live message: proactive compaction only runs before the
@@ -561,6 +600,144 @@ func (a *agent) stripImages() {
 			}
 		}
 	}
+}
+
+// rememberImages registers each image a tool returned under a fresh handle
+// (img1, img2, …) and returns a one-line hint naming them, so the model can send
+// one on Telegram by reference instead of pasting its base64 (which a small model
+// truncates, corrupting the request). The cache is bounded to the most recent
+// maxCachedImages and outlives stripImages, so a panel stays sendable on a later
+// turn. Callers must NOT hold a.mu.
+func (a *agent) rememberImages(imgs []lemonade.Image) string {
+	if len(imgs) == 0 {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.imgCache == nil {
+		a.imgCache = make(map[string]lemonade.Image)
+	}
+	handles := make([]string, 0, len(imgs))
+	for _, img := range imgs {
+		a.imgSeq++
+		h := fmt.Sprintf("img%d", a.imgSeq)
+		a.imgCache[h] = img
+		a.imgOrder = append(a.imgOrder, h)
+		handles = append(handles, h)
+	}
+	for len(a.imgOrder) > maxCachedImages {
+		old := a.imgOrder[0]
+		a.imgOrder = a.imgOrder[1:]
+		delete(a.imgCache, old)
+	}
+	return fmt.Sprintf("[Image saved as %s. To send it on Telegram, call a send tool (e.g. send_photo) with the base64 field set to %q — Homa inserts the real image. Never paste raw base64 yourself.]",
+		strings.Join(handles, ", "), handles[len(handles)-1])
+}
+
+// resolveImageArgs rewrites a Telegram send tool's arguments so an image handle
+// (img1, …) becomes the real cached bytes, and a missing image source is filled
+// from the most recent cached image. This keeps base64 entirely out of the model
+// — it only ever names a handle. Non-send tools, and calls that already carry a
+// real source, pass through unchanged.
+func (a *agent) resolveImageArgs(name, argsJSON string) string {
+	single := strings.HasSuffix(name, "send_photo") || strings.HasSuffix(name, "send_document")
+	album := strings.HasSuffix(name, "send_album")
+	if !single && !album {
+		return argsJSON
+	}
+	args := map[string]any{}
+	if s := strings.TrimSpace(argsJSON); s != "" {
+		if err := json.Unmarshal([]byte(s), &args); err != nil {
+			return argsJSON // let MCP validate a non-object / malformed payload
+		}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.imgOrder) == 0 {
+		return argsJSON // nothing cached to bridge to
+	}
+
+	changed := false
+	if album {
+		// Per album item, only resolve an explicit handle (and clean junk); never
+		// auto-inject the latest image, or a source-less item would silently
+		// duplicate the last picture across the album.
+		if items, ok := args["items"].([]any); ok {
+			for _, it := range items {
+				if m, ok := it.(map[string]any); ok && a.fillImageFields(m, false) {
+					changed = true
+				}
+			}
+		}
+	} else if a.fillImageFields(args, true) {
+		changed = true
+	}
+	if !changed {
+		return argsJSON
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return argsJSON
+	}
+	return string(b)
+}
+
+// fillImageFields resolves the image source on one send object and guarantees at
+// most one source survives (the MCP tool rejects two). Order: an exact handle in
+// base64/url/path wins and becomes the cached bytes; otherwise empty and
+// unresolved-handle source fields are stripped so a junk value can't sit beside a
+// real one; a real source the model chose is then left as-is; and only if no
+// source remains (and autoInject is set, i.e. a single send) is the most recent
+// image injected. Reports whether it mutated m. Callers must hold a.mu.
+func (a *agent) fillImageFields(m map[string]any, autoInject bool) bool {
+	// 1) An exact handle in any source field -> the cached bytes (wins outright).
+	for _, k := range []string{"base64", "url", "path"} {
+		if s, ok := m[k].(string); ok {
+			if img, ok := a.imgCache[strings.TrimSpace(s)]; ok {
+				delete(m, "url")
+				delete(m, "path")
+				m["base64"] = img.Data
+				return true
+			}
+		}
+	}
+	// 2) Drop empty / unresolved-handle source fields so a leftover junk value
+	// can't be sent alongside a real one.
+	changed := false
+	for _, k := range []string{"base64", "url", "path"} {
+		if s, ok := m[k].(string); ok && (strings.TrimSpace(s) == "" || looksLikeHandle(s)) {
+			delete(m, k)
+			changed = true
+		}
+	}
+	// 3) A real source the model chose -> leave it (cleanup above already ran).
+	for _, k := range []string{"base64", "url", "path"} {
+		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
+			return changed
+		}
+	}
+	// 4) No usable source left: inject the most recent image (single sends only).
+	if !autoInject {
+		return changed
+	}
+	m["base64"] = a.imgCache[a.imgOrder[len(a.imgOrder)-1]].Data
+	return true
+}
+
+// looksLikeHandle reports whether s is an image handle token (img + digits), so
+// an unresolved handle is treated as a missing source rather than literal base64.
+func looksLikeHandle(s string) bool {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "img") || len(s) == 3 {
+		return false
+	}
+	for _, r := range s[3:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // clampText trims s to at most limit bytes, marking the cut. The result is
@@ -852,6 +1029,22 @@ func playAudio(audio []byte, mime string) {
 
 // ---- misc ----------------------------------------------------------------
 
+// validToolCalls drops tool calls whose arguments are not valid JSON. A model
+// that hits the token cap mid-call (finish_reason "length") emits truncated
+// arguments; persisting them poisons the prompt so the backend rejects every
+// later turn. Empty arguments are allowed (a no-arg call).
+func validToolCalls(tcs []lemonade.ToolCall) []lemonade.ToolCall {
+	out := make([]lemonade.ToolCall, 0, len(tcs))
+	for _, tc := range tcs {
+		if s := strings.TrimSpace(tc.Arguments); s != "" && !json.Valid([]byte(s)) {
+			log.Printf("dropping tool call %s with malformed arguments (likely truncated): %s", tc.Name, truncate(s, 80))
+			continue
+		}
+		out = append(out, tc)
+	}
+	return out
+}
+
 // looksLikeToolCall reports whether s is a tool-call template the model leaked
 // into its reply text (Qwen/Hermes XML, or a bare JSON call) instead of a real
 // answer — so it is never read aloud.
@@ -936,6 +1129,17 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// hasImageSendTool reports whether the MCP exposes a Telegram tool that takes an
+// image, so the system prompt can teach the image-handle convention.
+func hasImageSendTool(ts []lemonade.Tool) bool {
+	for _, t := range ts {
+		if strings.HasSuffix(t.Name, "send_photo") || strings.HasSuffix(t.Name, "send_document") || strings.HasSuffix(t.Name, "send_album") {
+			return true
+		}
+	}
+	return false
 }
 
 func toolNames(ts []lemonade.Tool) []string {
